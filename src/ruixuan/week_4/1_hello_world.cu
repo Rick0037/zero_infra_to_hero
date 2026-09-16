@@ -1,4 +1,3 @@
-#include <__clang_cuda_builtin_vars.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdio.h>

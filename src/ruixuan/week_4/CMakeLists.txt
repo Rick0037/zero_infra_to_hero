@@ -31,21 +31,21 @@ link_directories(
     ${COMMON_LIB_DIRS}
 )
 #1
-add_executable(hello_world
-    hello_world.cu
+add_executable(1_hello_world
+    1_hello_world.cu
 )
 target_link_libraries(
-    hello_world PUBLIC
+    1_hello_world PUBLIC
     -lcudart
     -lcudadevrt)
-# #2
-# add_executable(2_indexing
-#     2_indexing.cu
-# )
-# target_link_libraries(
-#     2_indexing PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+#2
+add_executable(2_index
+    2_index.cu
+)
+target_link_libraries(
+    2_index PUBLIC
+    -lcudart
+    -lcudadevrt)
 # #3
 # add_executable(3_vectorAdd
 #     3_vectorAdd/3_vectorAdd.cu
