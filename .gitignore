@@ -17,3 +17,6 @@ uv.lock
 
 # Slurm logs
 logs/
+compile_commands.json
+.vscode/*
+.cache/*
