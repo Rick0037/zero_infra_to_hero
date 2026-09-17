@@ -70,21 +70,22 @@ target_link_libraries(
     4_device_query PUBLIC
     -lcudart
     -lcudadevrt)
-# #5.reduce
-# add_executable(reduce_baseline
-#     5_reduce/reduce_baseline.cu
-# )
-# target_link_libraries(
-#     reduce_baseline PUBLIC
-#     -lcudart
-#     -lcudadevrt)
-# add_executable(reduce_v0
-#     5_reduce/reduce_v0.cu
-# )
-# target_link_libraries(
-#     reduce_v0 PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+
+#5.reduce
+add_executable(reduce_baseline
+    5_reduce/reduce_baseline.cu
+)
+target_link_libraries(
+    reduce_baseline PUBLIC
+    -lcudart
+    -lcudadevrt)
+add_executable(reduce_v0
+    5_reduce/reduce_v0.cu
+)
+target_link_libraries(
+    reduce_v0 PUBLIC
+    -lcudart
+    -lcudadevrt)
 # add_executable(reduce_v1
 #     5_reduce/reduce_v1.cu
 # )
