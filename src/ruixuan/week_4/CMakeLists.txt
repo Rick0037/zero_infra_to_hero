@@ -54,21 +54,22 @@ target_link_libraries(
     3_vector_add PUBLIC
     -lcudart
     -lcudadevrt)
-# add_executable(3_1_vectorAdd
-#     3_vectorAdd/3_1_vectorized_vectorAdd.cu
-# )
-# target_link_libraries(
-#     3_1_vectorAdd PUBLIC
-#     -lcudart
-#     -lcudadevrt)
-# #4
-# add_executable(4_device_query
-#     4_device_query.cu
-# )
-# target_link_libraries(
-#     4_device_query PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+
+add_executable(3_1_vector_add
+    3_1_vector_add.cu
+)
+target_link_libraries(
+    3_1_vector_add PUBLIC
+    -lcudart
+    -lcudadevrt)
+#4
+add_executable(4_device_query
+    4_device_query.cu
+)
+target_link_libraries(
+    4_device_query PUBLIC
+    -lcudart
+    -lcudadevrt)
 # #5.reduce
 # add_executable(reduce_baseline
 #     5_reduce/reduce_baseline.cu
