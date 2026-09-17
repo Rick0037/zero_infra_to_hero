@@ -46,14 +46,14 @@ target_link_libraries(
     2_index PUBLIC
     -lcudart
     -lcudadevrt)
-# #3
-# add_executable(3_vectorAdd
-#     3_vectorAdd/3_vectorAdd.cu
-# )
-# target_link_libraries(
-#     3_vectorAdd PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+#3
+add_executable(3_vector_add
+    3_vector_add.cu
+)
+target_link_libraries(
+    3_vector_add PUBLIC
+    -lcudart
+    -lcudadevrt)
 # add_executable(3_1_vectorAdd
 #     3_vectorAdd/3_1_vectorized_vectorAdd.cu
 # )

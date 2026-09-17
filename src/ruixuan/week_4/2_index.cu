@@ -19,6 +19,7 @@ int main() {
     // host_x = CPU
     float *device_x, *host_x;
     //! 这里为什么是二级指针
+    //* cudaMalloc 返回的这个地址写入到device_x 的这个变量中
     cudaError_t error_code = cudaMalloc((void**)&device_x, nbtypes);
     printf("error_code is %d", error_code);
     // malloc 之后return 的是void*
