@@ -114,13 +114,13 @@ target_link_libraries(
     reduce_v4 PUBLIC
     -lcudart
     -lcudadevrt)
-# add_executable(reduce_v5
-#     5_reduce/reduce_v5.cu
-# )
-# target_link_libraries(
-#     reduce_v5 PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+add_executable(reduce_v5
+    5_reduce/reduce_v5.cu
+)
+target_link_libraries(
+    reduce_v5 PUBLIC
+    -lcudart
+    -lcudadevrt)
 # add_executable(reduce_v6
 #     5_reduce/reduce_v6.cu
 # )
