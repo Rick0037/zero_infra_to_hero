@@ -86,34 +86,34 @@ target_link_libraries(
     reduce_v0 PUBLIC
     -lcudart
     -lcudadevrt)
-# add_executable(reduce_v1
-#     5_reduce/reduce_v1.cu
-# )
-# target_link_libraries(
-#     reduce_v1 PUBLIC
-#     -lcudart
-#     -lcudadevrt)
-# add_executable(reduce_v2
-#     5_reduce/reduce_v2.cu
-# )
-# target_link_libraries(
-#     reduce_v2 PUBLIC
-#     -lcudart
-#     -lcudadevrt)
-# add_executable(reduce_v3
-#     5_reduce/reduce_v3.cu
-# )
-# target_link_libraries(
-#     reduce_v3 PUBLIC
-#     -lcudart
-#     -lcudadevrt)
-# add_executable(reduce_v4
-#     5_reduce/reduce_v4.cu
-# )
-# target_link_libraries(
-#     reduce_v4 PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+add_executable(reduce_v1
+    5_reduce/reduce_v1.cu
+)
+target_link_libraries(
+    reduce_v1 PUBLIC
+    -lcudart
+    -lcudadevrt)
+add_executable(reduce_v2
+    5_reduce/reduce_v2.cu
+)
+target_link_libraries(
+    reduce_v2 PUBLIC
+    -lcudart
+    -lcudadevrt)
+add_executable(reduce_v3
+    5_reduce/reduce_v3.cu
+)
+target_link_libraries(
+    reduce_v3 PUBLIC
+    -lcudart
+    -lcudadevrt)
+add_executable(reduce_v4
+    5_reduce/reduce_v4.cu
+)
+target_link_libraries(
+    reduce_v4 PUBLIC
+    -lcudart
+    -lcudadevrt)
 # add_executable(reduce_v5
 #     5_reduce/reduce_v5.cu
 # )

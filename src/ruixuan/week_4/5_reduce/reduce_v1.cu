@@ -21,13 +21,13 @@ __global__ void reduce_v0(float *d_in, float *d_out) {
         // 注意！v0并没有wa？rp divergence，因为没有else分支，视频目前这里讲错
         // 现在的v0和v1性能大体相似
         // v0 reduce_v0 latency = 0.595120 ms
-        if (tid % (2 * i) == 0) {
-            smem[tid] += smem[tid + i];
-        }
-        // v1 reduce_v1 latency = 0.465120 ms
-        // if ((tid & (2 * i - 1)) == 0) {
+        // if (tid % (2 * i) == 0) {
         //     smem[tid] += smem[tid + i];
         // }
+        // v1 reduce_v1 latency = 0.465120 ms
+        if ((tid & (2 * i - 1)) == 0) {
+            smem[tid] += smem[tid + i];
+        }
 
         // * 线程执行上一句之后一起停留在这里, 有些线程当时没有执行上一句
         // * 有些执行了上一句了。一起在这里等着放行
