@@ -121,21 +121,21 @@ target_link_libraries(
     reduce_v5 PUBLIC
     -lcudart
     -lcudadevrt)
-# add_executable(reduce_v6
-#     5_reduce/reduce_v6.cu
-# )
-# target_link_libraries(
-#     reduce_v6 PUBLIC
-#     -lcudart
-#     -lcudadevrt)
-# #6
-# add_executable(6_warp_level_reduce
-#     6_warp_level_reduce.cu
-# )
-# target_link_libraries(
-#     6_warp_level_reduce PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+add_executable(reduce_v6
+    5_reduce/reduce_v6.cu
+)
+target_link_libraries(
+    reduce_v6 PUBLIC
+    -lcudart
+    -lcudadevrt)
+#6
+add_executable(6_warp_level_reduce
+    6_warp_level_reduce.cu
+)
+target_link_libraries(
+    6_warp_level_reduce PUBLIC
+    -lcudart
+    -lcudadevrt)
 # #7
 # add_executable(7_histogram
 #     7_histogram.cu
