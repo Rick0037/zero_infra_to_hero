@@ -1,8 +1,7 @@
 // warp shuffle
 #include <bits/stdc++.h>
 #include <cuda.h>
-
-#include "cuda_runtime.h"
+#include <cuda_runtime.h>
 
 #define WarpSize 32
 // latency: 1.254ms
@@ -85,9 +84,28 @@ bool CheckResult(float *out, float groudtruth, int n) {
     return true;
 }
 
+void TestMaxSize(const int N) {
+    int blockSize;
+    int minGridSize;
+
+    // 自动计算使占用率最大化的 Block 大小
+    cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize,
+                                       reduce_warp_level<256>,  // kernel 函数指针
+                                       0,                       // 动态共享内存大小
+                                       0  // Block 大小上限（0 = 不限制）
+    );
+
+    int gridSize = (N + blockSize - 1) / blockSize;
+    // myKernel<<<gridSize, blockSize>>>(args);
+    printf("blockSize is %ld, minGridSize is %ld, gridSize is %ld\n", blockSize, minGridSize,
+           gridSize);
+    return;
+}
+
 int main() {
     float milliseconds = 0;
     const int N = 25600000;
+    TestMaxSize(N);
     cudaSetDevice(0);
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, 0);
