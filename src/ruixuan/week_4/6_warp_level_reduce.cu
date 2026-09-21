@@ -4,6 +4,64 @@
 #include <cuda_runtime.h>
 
 #define WarpSize 32
+
+__device__ float WarplevelMax(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float temp = __shfl_down_sync(0xffffffff, value, offset);
+        value = (value > temp) ? value : temp;
+    }
+    return value;
+}
+
+__device__ float WarplevelMin(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float temp = __shfl_down_sync(0xffffffff, value, offset);
+        value = (value < temp) ? value : temp;
+    }
+    return value;
+}
+
+// 全部归约到0
+__device__ float WarpLevelShffle(float sum) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    return sum;
+}
+
+__global__ void BlockLevelShffle(float *d_in, float *d_out, size_t N) {
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_thread_num = blockDim.x * gridDim.x;
+
+    // warp size 的归约
+    __shared__ float smem[WarpSize];
+    float sum = (gid < N) ? d_in[gid] : 0;
+
+    sum = WarpLevelShffle(sum);
+
+    int thread_warp_idx = tid % 32;
+    // block 内的warp index
+    int warp_idx = tid / 32;
+
+    if (thread_warp_idx == 0) {
+        smem[warp_idx] = sum;
+    }
+    __syncthreads();
+
+    // 第一个warp 来操作所有的
+    if (warp_idx == 0) {
+        //* 给第一个warp 中每个线程的 sum 都赋上值
+        sum = (thread_warp_idx < blockDim.x / WarpSize) ? smem[thread_warp_idx] : 0.0f;
+        sum = WarpLevelShffle(sum);
+    }
+    if (tid == 0) {
+        d_out[blockIdx.x] = sum;
+    }
+
+    return;
+}
+
 // latency: 1.254ms
 // *一个warp 内的递推
 // ? 深究全是问题

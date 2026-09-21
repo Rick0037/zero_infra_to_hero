@@ -136,6 +136,14 @@ target_link_libraries(
     6_warp_level_reduce PUBLIC
     -lcudart
     -lcudadevrt)
+
+add_executable(matrix_trans
+    matrix_trans.cu
+)
+target_link_libraries(
+    matrix_trans PUBLIC
+    -lcudart
+    -lcudadevrt)
 # #7
 # add_executable(7_histogram
 #     7_histogram.cu

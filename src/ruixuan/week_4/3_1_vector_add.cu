@@ -7,6 +7,38 @@
 #define BENCH_ITER 10
 #define THREADS_NUM 256
 
+__global__ void VectorReduceAdd(float *input, float *output, int N) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int grid = gridDim.x * blockDim.x;
+    float sum{0.0};
+
+    int loop_size = N / 4;
+    float4 *d_in = reinterpret_cast<float4 *>(input);
+
+    for (int i = tid; i < loop_size; i += grid) {
+        float4 temp_value = d_in[i];
+        sum += temp_value.x + temp_value.y + temp_value.z + temp_value.w;
+    }
+    int end_index = loop_size * 4;
+    for (int i = end_index + tid; i < N; i += loop_size) {
+        sum += input[i];
+    }
+    //! 实际sum的数值是 4 * loop的头几个数字
+    // // 实际output 的size 是
+    // // output[blockIdx.x] = sum;
+}
+
+__global__ void cpy(float *d_in, float *d_out, int N) {
+    int gid = blockDim.x * blockIdx.x + threadIdx.x;
+    int idx = gid * 4;
+    if (idx + 3 < N) {
+        //! 一个线程干4个活，先把他转成float4的数组在进行数据的搬运
+        float4 val = reinterpret_cast<float4 *>(d_in)[gid];
+        reinterpret_cast<float4 *>(d_out)[gid] = val;
+    }
+    return;
+}
+
 __device__ __forceinline__ float4 LoadFromGlobalPTX(float4 *ptr) {
     float4 ret;
     // ptx指令，是CUDA的更底层的语言，类似于汇编对于C/C++
@@ -35,6 +67,7 @@ __global__ void mem_bw(float *A, float *B, float *C) {
         // 问题1: 删除43-46行,会发现带宽数据为2666g/S
         // 尝试: 使用nv ptx load global memory指令,结果数据依然没变
         // 结论: 大概率是编译器优化:读了数据不做操作那就会不读
+        //! 先切换成了float4 的数组，然后才方位【I】的
         float4 a1 = reinterpret_cast<float4 *>(A)[i];
         // float4 a1 = LoadFromGlobalPTX(reinterpret_cast<float4*>(A) + i);
         float4 b1 = reinterpret_cast<float4 *>(B)[i];
