@@ -144,7 +144,16 @@ target_link_libraries(
     matrix_trans PUBLIC
     -lcudart
     -lcudadevrt)
-# #7
+
+add_executable(reduce_finial
+    5_reduce/reduce_finial.cu
+)
+target_link_libraries(
+    reduce_finial PUBLIC
+    -lcudart
+    -lcudadevrt)
+
+    # #7
 # add_executable(7_histogram
 #     7_histogram.cu
 # )
