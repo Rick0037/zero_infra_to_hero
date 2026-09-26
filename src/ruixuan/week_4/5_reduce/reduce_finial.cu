@@ -162,26 +162,40 @@ void TestKernel(size_t N) {
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    cudaEventRecord(start);
-    //*-----kernel----
-    // v1 朴素
-    // reduce_v1<<<1, 1>>>(d_in, d_out, N);
 
-    // v2 交错寻址但是有bank
-    // reduce_v2<BlockSize><<<GridSize, BlockSize>>>(d_in, d_middle_value, N);
+    //*-----多轮计时: 每轮先用大块 memset 把 L2 冲掉, memset 不在计时窗口内----
+    const int iters = 10;
+    size_t flush_size = 256ull * 1024 * 1024;  // 256MB > 4090D 的 72MB L2
+    char* d_flush;
+    cudaMalloc((void**)&d_flush, flush_size);
 
-    // v3 sequential addressing
-    // reduce_v3<BlockSize><<<GridSize, BlockSize>>>(d_in, d_middle_value, N);
+    for (int it = 0; it < iters; ++it) {
+        cudaMemset(d_flush, 0, flush_size);
+        cudaEventRecord(start);
+        //*-----kernel----
+        // v1 朴素
+        // reduce_v1<<<1, 1>>>(d_in, d_out, N);
 
-    // v4 提前进行加载干一半的活动
-    // reduce_v4<BlockSize / 2><<<GridSize, BlockSize / 2>>>(d_in, d_middle_value, N);
+        // v2 交错寻址但是有bank
+        reduce_v2<BlockSize><<<GridSize, BlockSize>>>(d_in, d_middle_value, N);
 
-    // v5 warp level
-    reduce_v5<BlockSize><<<GridSize, BlockSize>>>(d_in, d_middle_value, N);
+        // v3 sequential addressing
+        // reduce_v3<BlockSize><<<GridSize, BlockSize>>>(d_in, d_middle_value, N);
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&milliseconds, start, stop);
+        // v4 提前进行加载干一半的活动
+        // reduce_v4<BlockSize / 2><<<GridSize, BlockSize / 2>>>(d_in, d_middle_value, N);
+
+        // v5 warp level
+        // reduce_v5<BlockSize><<<GridSize, BlockSize>>>(d_in, d_middle_value, N);
+
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, start, stop);
+        milliseconds += ms;
+    }
+    cudaFree(d_flush);
+    milliseconds /= iters;
 
     //*-----出来之后在进行reduce----
     // v2 第二级交给 CPU：把每个 block 的局部和拷回主机求和
