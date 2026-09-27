@@ -64,6 +64,7 @@ __global__ void online_softmax_v1(float* in, float* out, int m, int n) {
         float sum{0.0};
         float max_value = -INFINITY;
         for (int j = threadIdx.x; j < n; j += blockDim.x) {
+            //! 这里实际上满足连续访问内存的
             float value = x[j];
             float new_max_value = fmax(max_value, value);
             // * 注意要加新的数值
@@ -413,6 +414,7 @@ int main() {
     // online_softmax_v2 latency = 0.148582 ms (grid size = 4096)
     // online_softmax_v3 latency = 0.161402 ms (没有使用寄存器 还是使用的local memory 或者stack)
     // online_softmax_v3 latency = 0.145382 ms (使用了寄存器)
+    // online_softmax_v4  实际和上面v2 基本上一样就是加了一个最后的sync threads 控制
     // * 如何判断是否使用了寄存器
 
     /*
