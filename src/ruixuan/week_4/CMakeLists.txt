@@ -201,14 +201,30 @@ target_link_libraries(
 #     10_fp16 PUBLIC
 #     -lcudart
 #     -lcudadevrt)
-# #11
-# add_executable(11_softmax
-#     11_softmax.cu
-# )
-# target_link_libraries(
-#     11_softmax PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+#11
+add_executable(11_softmax
+    11_softmax.cu
+)
+target_link_libraries(
+    11_softmax PUBLIC
+    -lcudart
+    -lcudadevrt)
+
+add_executable(11_softmax_native
+    11_softmax_native.cu
+)
+target_link_libraries(
+    11_softmax_native PUBLIC
+    -lcudart
+    -lcudadevrt)
+
+add_executable(11_online_softmax
+    11_online_softmax.cu
+)
+target_link_libraries(
+    11_online_softmax PUBLIC
+    -lcudart
+    -lcudadevrt)
 # #12
 # add_executable(12_measure_GPU_peak_perf
 #     12_measure_GPU_peak_perf.cu
