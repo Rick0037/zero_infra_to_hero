@@ -225,14 +225,14 @@ target_link_libraries(
     11_online_softmax PUBLIC
     -lcudart
     -lcudadevrt)
-# #12
-# add_executable(12_measure_GPU_peak_perf
-#     12_measure_GPU_peak_perf.cu
-# )
-# target_link_libraries(
-#     12_measure_GPU_peak_perf PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+#12
+add_executable(12_measure_GPU_peak_perf
+    12_measure_GPU_peak_perf.cu
+)
+target_link_libraries(
+    12_measure_GPU_peak_perf PUBLIC
+    -lcudart
+    -lcudadevrt)
 # #13 CUDA stream
 # add_executable(13_1_CUDAstream
 #     13_CUDAstream/13_1_CUDAstream_kernels_overlap.cu
