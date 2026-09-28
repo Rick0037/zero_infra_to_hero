@@ -233,21 +233,21 @@ target_link_libraries(
     12_measure_GPU_peak_perf PUBLIC
     -lcudart
     -lcudadevrt)
-# #13 CUDA stream
-# add_executable(13_1_CUDAstream
-#     13_CUDAstream/13_1_CUDAstream_kernels_overlap.cu
-# )
-# target_link_libraries(
-#     13_1_CUDAstream PUBLIC
-#     -lcudart
-#     -lcudadevrt)
-# add_executable(13_2_CUDAstream
-#     13_CUDAstream/13_2_CUDAstream_kernel_copy_overlap.cu
-# )
-# target_link_libraries(
-#     13_2_CUDAstream PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+#13 CUDA stream
+add_executable(13_cuda_stream
+    13_cuda_stream/13_cuda_stream.cu
+)
+target_link_libraries(
+    13_cuda_stream PUBLIC
+    -lcudart
+    -lcudadevrt)
+add_executable(13_1_cuda_stream
+    13_cuda_stream/13_1_cuda_stream.cu
+)
+target_link_libraries(
+    13_1_cuda_stream PUBLIC
+    -lcudart
+    -lcudadevrt)
 # #14
 # add_executable(14_quantize
 #     14_quantize.cu
