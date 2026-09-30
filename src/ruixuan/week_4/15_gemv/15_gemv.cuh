@@ -356,6 +356,7 @@ __global__ void gemv2_kernel(float* matrix, float* vector, float* res, int N, in
         __syncthreads();
     }
     if (tid < THREADS_PER_VALUE) {
+        //! @注意这里最好就是向量化的写!
         reinterpret_cast<float4*>(res)[col_idx] = smem[tid];
     }
 }
