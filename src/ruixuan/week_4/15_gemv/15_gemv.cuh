@@ -228,94 +228,137 @@ struct DispatchLauncher {
 // [1, N] * [N, M]
 // logits * v
 // 有关fp32/fp16 fma和add的各种重载操作
-// namespace gemv2 {
-// struct half8 {
-//     half2 h1;
-//     half2 h2;
-//     half2 h3;
-//     half2 h4;
+namespace gemv2 {
+struct half8 {
+    half2 h1;
+    half2 h2;
+    half2 h3;
+    half2 h4;
 
-//     __device__ half8& operator=(half8 h8) {
-//         h1 = h8.h1;
-//         h2 = h8.h2;
-//         h3 = h8.h3;
-//         h4 = h8.h4;
-//         return *this;
-//     }
-// };
+    __device__ half8& operator=(half8 h8) {
+        h1 = h8.h1;
+        h2 = h8.h2;
+        h3 = h8.h3;
+        h4 = h8.h4;
+        return *this;
+    }
+};
 
-// template <int M, typename T>
-// struct get_threads_per_mat_row {
-//     static const int value = M * sizeof(T) / 16;
-// };
+//* 实际上是M行的数据, 如果是T 是fp32 就是每行总共有M/4的数据等待被处理
+//* 如果是T 是fp16 就是每行总共有M/8的数据等待被处理
 
-// inline __device__ float add(float a, float b) { return a + b; }
+template <int M, typename T>
+struct get_threads_per_mat_row {
+    static const int value = M * sizeof(T) / 16;
+};
 
-// inline __device__ float4 add(float4 a, float4 b) {
-//     float4 c;
-//     c.x = gemv2::add(a.x, b.x);
-//     c.y = gemv2::add(a.y, b.y);
-//     c.z = gemv2::add(a.z, b.z);
-//     c.w = gemv2::add(a.w, b.w);
-//     return c;
-// }
-// inline __device__ half add(half a, half b) {
-//     // return __hadd(a, b);
-//     // if use L216, half+half is not really adding, its so weird, which  cause our result is 32,
-//     not
-//     // 256
-//     return (half)((float)a + (float)b);
-// }
+inline __device__ float add(float a, float b) { return a + b; }
 
-// inline __device__ half2 add(half2 a, half2 b) {
-//     half2 res;
-//     res.x = gemv2::add(a.x, b.x);
-//     res.y = gemv2::add(a.y, b.y);
-//     return res;
-// }
+inline __device__ float4 add(float4 a, float4 b) {
+    float4 c;
+    c.x = gemv2::add(a.x, b.x);
+    c.y = gemv2::add(a.y, b.y);
+    c.z = gemv2::add(a.z, b.z);
+    c.w = gemv2::add(a.w, b.w);
+    return c;
+}
+inline __device__ half add(half a, half b) {
+    // return __hadd(a, b);
+    // if use L216, half+half is not really adding, its so weird, which  cause our result is 32,not
+    // 256
+    return (half)((float)a + (float)b);
+}
 
-// inline __device__ half8 add(half8 a, half8 b) {
-//     half8 c;
-//     c.h1 = gemv2::add(a.h1, b.h1);
-//     c.h2 = gemv2::add(a.h2, b.h2);
-//     c.h3 = gemv2::add(a.h3, b.h3);
-//     c.h4 = gemv2::add(a.h4, b.h4);
-//     return c;
-// }
+inline __device__ half2 add(half2 a, half2 b) {
+    half2 res;
+    res.x = gemv2::add(a.x, b.x);
+    res.y = gemv2::add(a.y, b.y);
+    return res;
+}
 
-// inline __device__ half fma(half a, half b, half c) {
-//     // 有的编译器会不认识half intrinsic 例如__hmul或者__hadd，这很奇怪
-//     // 所以粗暴转成fp32计算再转回fp16
-//     return __float2half((float)a * (float)b + (float)c);
-// }
+inline __device__ half8 add(half8 a, half8 b) {
+    half8 c;
+    c.h1 = gemv2::add(a.h1, b.h1);
+    c.h2 = gemv2::add(a.h2, b.h2);
+    c.h3 = gemv2::add(a.h3, b.h3);
+    c.h4 = gemv2::add(a.h4, b.h4);
+    return c;
+}
 
-// inline __device__ half2 fma(half a, half2 b, half2 c) {
-//     half2 res;
-//     res.x = gemv2::fma(a, b.x, c.x);
-//     res.y = gemv2::fma(a, b.y, c.y);
-//     return res;
-// }
+inline __device__ half fma(half a, half b, half c) {
+    // 有的编译器会不认识half intrinsic 例如__hmul或者__hadd，这很奇怪
+    // 所以粗暴转成fp32计算再转回fp16
+    return __float2half((float)a * (float)b + (float)c);
+}
 
-// inline __device__ half8 fma(half a, half8 b, half8 c) {
-//     half8 d;
-//     d.h1 = gemv2::fma(a, b.h1, c.h1);
-//     d.h2 = gemv2::fma(a, b.h2, c.h2);
-//     d.h3 = gemv2::fma(a, b.h3, c.h3);
-//     d.h4 = gemv2::fma(a, b.h4, c.h4);
-//     return d;
-// }
+inline __device__ half2 fma(half a, half2 b, half2 c) {
+    half2 res;
+    res.x = gemv2::fma(a, b.x, c.x);
+    res.y = gemv2::fma(a, b.y, c.y);
+    return res;
+}
 
-// inline __device__ float fma(float a, float b, float c) { return a * b + c; }
+inline __device__ half8 fma(half a, half8 b, half8 c) {
+    half8 d;
+    d.h1 = gemv2::fma(a, b.h1, c.h1);
+    d.h2 = gemv2::fma(a, b.h2, c.h2);
+    d.h3 = gemv2::fma(a, b.h3, c.h3);
+    d.h4 = gemv2::fma(a, b.h4, c.h4);
+    return d;
+}
 
-// inline __device__ float4 fma(float a, float4 b, float4 c) {
-//     float4 d;
-//     d.x = gemv2::fma(a, b.x, c.x);
-//     d.y = gemv2::fma(a, b.y, c.y);
-//     d.z = gemv2::fma(a, b.z, c.z);
-//     d.w = gemv2::fma(a, b.w, c.w);
-//     return d;
-// }
-// }  // namespace gemv2
+inline __device__ float fma(float a, float b, float c) { return a * b + c; }
+
+inline __device__ float4 fma(float a, float4 b, float4 c) {
+    float4 d;
+    d.x = gemv2::fma(a, b.x, c.x);
+    d.y = gemv2::fma(a, b.y, c.y);
+    d.z = gemv2::fma(a, b.z, c.z);
+    d.w = gemv2::fma(a, b.w, c.w);
+    return d;
+}
+}  // namespace gemv2
+
+// for fp32: <64, M * sizeof(T) / 16 = M / 4, 4>
+template <int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
+__global__ void gemv2_kernel(float* matrix, float* vector, float* res, int N, int M) {
+    int tid = threadIdx.x;
+    int row_idx = tid / THREADS_PER_VALUE;
+    int col_idx = tid % THREADS_PER_VALUE;
+
+    // 一共循环处理几次, 针对一个矩阵
+    // 或者求出每次循环得间隔
+    constexpr int loop_iter = THREADS_PER_BLOCK / THREADS_PER_VALUE;
+    // * smem size =  THREADS_PER_VALUE * (THREADS_PER_BLOCK / THREADS_PER_VALUE)
+    __shared__ float4 smem[THREADS_PER_BLOCK];
+    //* 这里得out 每个线程得out 就是自己负责得float4 对应的一个变量,
+    float4 out{0.0, 0.0, 0.0, 0.0};
+    //* 实际上计算得时候已经按照float4 在计算index了
+    for (int j = row_idx; j < N; j += loop_iter) {
+        // 可以使用matrix 换成float4 再去寻找地址, 也可以先换成float在寻找地图
+        float4 mat_value = reinterpret_cast<float4*>(matrix)[j * THREADS_PER_VALUE + col_idx];
+        float vec_value = vector[j];
+        out = gemv2::fma(vec_value, mat_value, out);
+
+        // vector 不需要float4, 需要得是一个数值
+        // float4 vec_value = reinterpret_cast<float4*>(vector)[row_idx];
+    }
+    smem[tid] = out;
+    __syncthreads();
+
+    //
+    for (int i = loop_iter / 2; i > 0; i >>= 1) {
+        int count = loop_iter / i;
+        int offset = THREADS_PER_BLOCK / count;
+        if (tid < offset) {
+            smem[tid] = gemv2::add(smem[tid], smem[tid + offset]);
+        }
+        __syncthreads();
+    }
+    if (tid < THREADS_PER_VALUE) {
+        reinterpret_cast<float4*>(res)[col_idx] = smem[tid];
+    }
+}
 
 // // 1个block处理一个[1, M], 循环处理完[N, M]
 // // for fp32: <64, M * sizeof(T) / 16 = M / 4, 4>
@@ -357,39 +400,39 @@ struct DispatchLauncher {
 //     }
 // }
 
-// // for fp16: <64, M * sizeof(T) / 16 = M / 8, 8>
-// template <int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
-// __global__ void gemv2_kernel(half* matrix, half* vector, half* res, int N, int M) {
-//     int tid = threadIdx.x;
-//     int mat_o = tid / THREADS_PER_VALUE;
-//     int mat_i = tid % THREADS_PER_VALUE * VEC_SIZE;
-//     constexpr int ROW_PER_ITER = THREADS_PER_BLOCK / THREADS_PER_VALUE;
-//     __shared__ half out_smem[2048];
-//     gemv2::half8 out;
-//     // zero(out);
-//     for (int ti = mat_o; ti < N; ti += ROW_PER_ITER) {
-//         gemv2::half8 mat = *reinterpret_cast<gemv2::half8*>(&matrix[ti * M + mat_i]);
-//         half logits = vector[ti];
-//         out = gemv2::fma(logits, mat, out);
-//     }
-//     for (int ROWS_PER_BLOCK = ROW_PER_ITER; ROWS_PER_BLOCK >= 2; ROWS_PER_BLOCK /= 2) {
-//         int midpoint = ROWS_PER_BLOCK / 2;
-//         if (mat_o >= midpoint && mat_o < ROWS_PER_BLOCK) {
-//             *reinterpret_cast<gemv2::half8*>(&out_smem[(mat_o - midpoint) * M + mat_i]) = out;
-//         }
-//         __syncthreads();
+// for fp16: <64, M * sizeof(T) / 16 = M / 8, 8>
+template <int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
+__global__ void gemv2_kernel(half* matrix, half* vector, half* res, int N, int M) {
+    int tid = threadIdx.x;
+    int mat_o = tid / THREADS_PER_VALUE;
+    int mat_i = tid % THREADS_PER_VALUE * VEC_SIZE;
+    constexpr int ROW_PER_ITER = THREADS_PER_BLOCK / THREADS_PER_VALUE;
+    __shared__ half out_smem[2048];
+    //! out 必须清零, 否则 fma 在栈垃圾上累加, 结果是 nan/inf
+    half2 zero_h2 = __float2half2_rn(0.0f);
+    gemv2::half8 out{zero_h2, zero_h2, zero_h2, zero_h2};
+    for (int ti = mat_o; ti < N; ti += ROW_PER_ITER) {
+        gemv2::half8 mat = *reinterpret_cast<gemv2::half8*>(&matrix[ti * M + mat_i]);
+        half logits = vector[ti];
+        out = gemv2::fma(logits, mat, out);
+    }
+    for (int ROWS_PER_BLOCK = ROW_PER_ITER; ROWS_PER_BLOCK >= 2; ROWS_PER_BLOCK /= 2) {
+        int midpoint = ROWS_PER_BLOCK / 2;
+        if (mat_o >= midpoint && mat_o < ROWS_PER_BLOCK) {
+            *reinterpret_cast<gemv2::half8*>(&out_smem[(mat_o - midpoint) * M + mat_i]) = out;
+        }
+        __syncthreads();
 
-//         if (mat_o < midpoint) {
-//             // ROW_PER_ITER中上半部分out和下半部分out相加
-//             out = gemv2::add(*reinterpret_cast<gemv2::half8*>(&out_smem[mat_o * M + mat_i]),
-//             out);
-//         }
-//         __syncthreads();
-//     }
-//     if (mat_o == 0) {
-//         *reinterpret_cast<gemv2::half8*>(&res[mat_i]) = out;
-//     }
-// }
+        if (mat_o < midpoint) {
+            // ROW_PER_ITER中上半部分out和下半部分out相加
+            out = gemv2::add(*reinterpret_cast<gemv2::half8*>(&out_smem[mat_o * M + mat_i]), out);
+        }
+        __syncthreads();
+    }
+    if (mat_o == 0) {
+        *reinterpret_cast<gemv2::half8*>(&res[mat_i]) = out;
+    }
+}
 // // TODO: 修改float4部分为可以泛化表示float4和half8类型的代码,
 // // 而后此模板函数可以取代以上fp32和fp16的gemv2
 // template <int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE, typename T>
@@ -424,32 +467,35 @@ struct DispatchLauncher {
 //     }
 // }
 
-// template <int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
-// struct DispatchLauncher2 {
-//     template <typename T>
-//     static void launcher(T* d_mat, T* d_vec, T* d_dst, int M, int N) {
-//         dim3 Grid(1);
-//         dim3 Block(THREADS_PER_BLOCK);
-//         float milliseconds = 0;
-//         // 使用cudaevent计时，开销最小
-//         cudaEvent_t start, stop;
-//         cudaEventCreate(&start);
-//         cudaEventCreate(&stop);
-//         cudaEventRecord(start);
-//         printf("calling\n");
-//         // 启动cuda kernel
-//         gemv2_kernel<THREADS_PER_BLOCK, THREADS_PER_VALUE, VEC_SIZE>
-//             <<<Grid, Block>>>(d_mat, d_vec, d_dst, N, M);
-//         cudaError_t result = cudaGetLastError();
-//         if (result) {
-//             throw std::runtime_error(std::string("[ERROR] CUDA runtime error: ") +
-//                                      (_cudaGetErrorEnum(result)) + " " + __FILE__ + ":" +
-//                                      std::to_string(__LINE__) + " \n");
-//         }
-//         printf("called\n");
-//         cudaEventRecord(stop);
-//         cudaEventSynchronize(stop);
-//         cudaEventElapsedTime(&milliseconds, start, stop);
-//         printf("gemv latency = %f ms\n", milliseconds);
-//     }
-// };
+//? THREADS_PER_BLOCK thread nums in block
+//? THREADS_PER_VALUE each row number wants to solve
+template <int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
+struct DispatchLauncher2 {
+    template <typename T>
+    static void launcher(T* d_mat, T* d_vec, T* d_dst, int M, int N) {
+        dim3 Grid(1);
+        dim3 Block(THREADS_PER_BLOCK);
+        float milliseconds = 0;
+        // 使用cudaevent计时，开销最小
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start);
+        printf("calling\n");
+        // 启动cuda kernel
+        //* 这里默认了 THREADS_PER_BLOCK > THREADS_PER_VALUE, 一个block thread扫一遍能处理很多行
+        gemv2_kernel<THREADS_PER_BLOCK, THREADS_PER_VALUE, VEC_SIZE>
+            <<<Grid, Block>>>(d_mat, d_vec, d_dst, N, M);
+        cudaError_t result = cudaGetLastError();
+        if (result) {
+            throw std::runtime_error(std::string("[ERROR] CUDA runtime error: ") +
+                                     (_cudaGetErrorEnum(result)) + " " + __FILE__ + ":" +
+                                     std::to_string(__LINE__) + " \n");
+        }
+        printf("called\n");
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        printf("gemv latency = %f ms\n", milliseconds);
+    }
+};

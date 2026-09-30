@@ -273,13 +273,13 @@ target_link_libraries(
     15_1_gemv PUBLIC
     -lcudart
     -lcudadevrt)
-# add_executable(15_2_gemv
-#     15_gemv/15_2_fp32_fp16_gemv.cu
-# )
-# target_link_libraries(
-#     15_2_gemv PUBLIC
-#     -lcudart
-#     -lcudadevrt)
+add_executable(15_2_gemv
+    15_gemv/15_2_fp32_fp16_gemv.cu
+)
+target_link_libraries(
+    15_2_gemv PUBLIC
+    -lcudart
+    -lcudadevrt)
 # #16 dropout
 # add_executable(16_dropout
 #     16_fused_dropout/16_dropout.cu
