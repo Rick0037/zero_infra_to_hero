@@ -7,6 +7,444 @@
 
 #define WarpSize 32
 
+// V0: 朴素实现，一个线程处理一行
+__global__ void learning_softmax_v0(float* in, float* out, int M, int N) {
+    // 一个线程处理一行
+    // int tid = threadIdx.x;
+    int gid = blockDim.x * blockIdx.x + threadIdx.x;
+    // 一个线程处理多行
+    int loop_size = blockDim.x * gridDim.x;
+    for (int index = gid; index < M; index += loop_size) {
+        float* start = in + index * N;
+        float* out_start = out + index * N;
+
+        float max_value = -INFINITY;
+        for (int j = 0; j < N; j++) {
+            max_value = fmax(start[j], max_value);
+        }
+        float sum{0.0};
+        for (int j = 0; j < N; j++) {
+            sum += std::exp(start[j] - max_value);
+        }
+
+        for (int j = 0; j < N; j++) {
+            out_start[j] = std::exp(start[j] - max_value) / sum;
+        }
+    }
+    return;
+}
+
+// v1 一个block 负责一行
+template <int BlockSize>
+__global__ void learning_softmax_v1(float* in, float* out, int M, int N) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    // 只需要一个memory 使用两种用途
+    __shared__ float smem[BlockSize];
+    for (int index = bid; index < M; index += gridDim.x) {
+        // block 内的起始地址
+        float* start = in + index * N;
+        float* out_start = out + index * N;
+
+        float max_value = -INFINITY;
+        //! 一个线程内不需要加shared memory
+        for (int j = tid; j < N; j += blockDim.x) {
+            max_value = fmax(start[j], max_value);
+        }
+        smem[tid] = max_value;
+        __syncthreads();
+
+        for (int j = BlockSize / 2; j > 0; j >>= 1) {
+            if (tid < j) {
+                smem[tid] = fmax(smem[tid], smem[tid + j]);
+            }
+            __syncthreads();
+        }
+        max_value = smem[0];
+        __syncthreads();
+
+        // 求sum
+        float sum{0.0};
+        for (int j = tid; j < N; j += blockDim.x) {
+            sum += std::exp(start[j] - max_value);
+        }
+
+        smem[tid] = sum;
+        __syncthreads();
+        for (int j = BlockSize / 2; j > 0; j >>= 1) {
+            if (tid < j) {
+                smem[tid] += smem[tid + j];
+            }
+            __syncthreads();
+        }
+
+        sum = smem[0];
+        __syncthreads();
+
+        for (int j = tid; j < N; j += blockDim.x) {
+            out_start[j] = std::exp(start[j] - max_value) / sum;
+        }
+    }
+    return;
+}
+
+// 需要for循环的过程中, 每个线程也在更新Sum的数值, 参与下一次的发射
+__device__ __forceinline__ float learning_warp_level_sum(float sum) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    return sum;
+}
+
+__device__ __forceinline__ float learning_warp_level_max(float max_value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_value = fmax(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+    }
+    return max_value;
+}
+
+// v2 block 内使用warp进行归约
+template <int BlockSize>
+__global__ void learning_softmax_v2(float* in, float* out, int M, int N) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_index = tid / WarpSize;
+
+    // 只需要一个memory 使用两种用途
+    __shared__ float smem[BlockSize / WarpSize];
+    for (int index = bid; index < M; index += gridDim.x) {
+        // block 内的起始地址
+        float* start = in + index * N;
+        float* out_start = out + index * N;
+
+        float max_value = -INFINITY;
+        for (int j = tid; j < N; j += blockDim.x) {
+            max_value = fmax(start[j], max_value);
+        }
+
+        max_value = learning_warp_level_max(max_value);
+
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = max_value;
+        }
+        __syncthreads();
+
+        max_value = (tid < BlockSize / WarpSize) ? smem[tid] : -INFINITY;
+        __syncthreads();
+        //! warp index == 0, 只有一个线程参与
+        if (warp_index == 0) {
+            max_value = learning_warp_level_max(max_value);
+            if (tid == 0) {
+                smem[tid] = max_value;
+            }
+        }
+        __syncthreads();
+        max_value = smem[0];
+        __syncthreads();
+        float sum{0.0};
+        for (int j = tid; j < N; j += blockDim.x) {
+            sum += std::exp(start[j] - max_value);
+        }
+
+        sum = learning_warp_level_sum(sum);
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = sum;
+        }
+        __syncthreads();
+
+        sum = (tid < BlockSize / WarpSize) ? smem[tid] : 0.0;
+        __syncthreads();
+        //! warp index == 0, 只有一个线程参与
+        if (warp_index == 0) {
+            sum = learning_warp_level_sum(sum);
+            if (tid == 0) {
+                smem[tid] = sum;
+            }
+        }
+
+        __syncthreads();
+        sum = smem[0];
+        __syncthreads();
+        for (int j = tid; j < N; j += blockDim.x) {
+            out_start[j] = std::exp(start[j] - max_value) / sum;
+        }
+    }
+    return;
+}
+
+// 向量化加载
+template <int BlockSize>
+__global__ void learning_softmax_v3(float* in, float* out, int M, int N) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_index = tid / WarpSize;
+
+    // 只需要一个memory 使用两种用途
+    __shared__ float smem[BlockSize / WarpSize];
+    // 向量化处理的实际就少了
+    for (int index = bid; index < M; index += gridDim.x) {
+        // block 内的起始地址
+        float4* start = &(reinterpret_cast<float4*>(in)[index * N / 4]);
+        float4* out_start = &(reinterpret_cast<float4*>(out)[index * N / 4]);
+
+        float max_value = -INFINITY;
+
+        for (int j = tid; j < N / 4; j += blockDim.x) {
+            float4 temp_value = start[j];
+            max_value = fmax(temp_value.x, max_value);
+            max_value = fmax(temp_value.y, max_value);
+            max_value = fmax(temp_value.z, max_value);
+            max_value = fmax(temp_value.w, max_value);
+        }
+
+        max_value = learning_warp_level_max(max_value);
+
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = max_value;
+        }
+        __syncthreads();
+
+        max_value = (tid < BlockSize / WarpSize) ? smem[tid] : -INFINITY;
+        __syncthreads();
+        //! warp index == 0, 只有一个线程参与
+        if (warp_index == 0) {
+            max_value = learning_warp_level_max(max_value);
+            if (tid == 0) {
+                smem[tid] = max_value;
+            }
+        }
+        __syncthreads();
+        max_value = smem[0];
+        __syncthreads();
+        float sum{0.0};
+        for (int j = tid; j < N / 4; j += blockDim.x) {
+            float4 temp_value = start[j];
+            sum += std::exp(temp_value.x - max_value);
+            sum += std::exp(temp_value.y - max_value);
+            sum += std::exp(temp_value.z - max_value);
+            sum += std::exp(temp_value.w - max_value);
+        }
+
+        sum = learning_warp_level_sum(sum);
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = sum;
+        }
+        __syncthreads();
+
+        sum = (tid < BlockSize / WarpSize) ? smem[tid] : 0.0;
+        __syncthreads();
+        //! warp index == 0, 只有一个线程参与
+        if (warp_index == 0) {
+            sum = learning_warp_level_sum(sum);
+            if (tid == 0) {
+                smem[tid] = sum;
+            }
+        }
+
+        __syncthreads();
+        sum = smem[0];
+        __syncthreads();
+        for (int j = tid; j < N / 4; j += blockDim.x) {
+            float4 temp_value = start[j];
+            temp_value.x = std::exp(temp_value.x - max_value) / sum;
+            temp_value.y = std::exp(temp_value.y - max_value) / sum;
+            temp_value.z = std::exp(temp_value.z - max_value) / sum;
+            temp_value.w = std::exp(temp_value.w - max_value) / sum;
+            out_start[j] = temp_value;
+        }
+    }
+    return;
+}
+
+// v4 使用寄存器 或者共享内存去保存中间temp value - max value的数值
+template <int BlockSize, int ColSize>
+__global__ void learning_softmax_v4(float* in, float* out, int M, int N) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_index = tid / WarpSize;
+
+    // 只需要一个memory 使用两种用途
+    __shared__ float smem[BlockSize / WarpSize];
+    // ! 这里实际上错了, 每个线程用不了这么多的
+    float4 register_array[ColSize / 4];
+    // 向量化处理的实际就少了
+    for (int index = bid; index < M; index += gridDim.x) {
+        // block 内的起始地址
+        float4* start = &(reinterpret_cast<float4*>(in)[index * N / 4]);
+        float4* out_start = &(reinterpret_cast<float4*>(out)[index * N / 4]);
+
+        float max_value = -INFINITY;
+
+        for (int j = tid; j < N / 4; j += blockDim.x) {
+            float4 temp_value = start[j];
+            max_value = fmax(temp_value.x, max_value);
+            max_value = fmax(temp_value.y, max_value);
+            max_value = fmax(temp_value.z, max_value);
+            max_value = fmax(temp_value.w, max_value);
+        }
+
+        max_value = learning_warp_level_max(max_value);
+
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = max_value;
+        }
+        __syncthreads();
+
+        max_value = (tid < BlockSize / WarpSize) ? smem[tid] : -INFINITY;
+        __syncthreads();
+        //! warp index == 0, 只有一个线程参与
+        if (warp_index == 0) {
+            max_value = learning_warp_level_max(max_value);
+            if (tid == 0) {
+                smem[tid] = max_value;
+            }
+        }
+        __syncthreads();
+        max_value = smem[0];
+        __syncthreads();
+        float sum{0.0};
+        for (int j = tid; j < N / 4; j += blockDim.x) {
+            float4 temp_value = start[j];
+            float4 exp_value;
+            exp_value.x = std::exp(temp_value.x - max_value);
+            exp_value.y = std::exp(temp_value.y - max_value);
+            exp_value.z = std::exp(temp_value.z - max_value);
+            exp_value.w = std::exp(temp_value.w - max_value);
+            sum += exp_value.x + exp_value.y + exp_value.z + exp_value.w;
+            register_array[j] = exp_value;  // 暂存 exp 结果，写回阶段不再重算 exp
+        }
+
+        sum = learning_warp_level_sum(sum);
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = sum;
+        }
+        __syncthreads();
+
+        sum = (tid < BlockSize / WarpSize) ? smem[tid] : 0.0;
+        __syncthreads();
+        //! warp index == 0, 只有一个线程参与
+        if (warp_index == 0) {
+            sum = learning_warp_level_sum(sum);
+            if (tid == 0) {
+                smem[tid] = sum;
+            }
+        }
+
+        __syncthreads();
+        sum = smem[0];
+        __syncthreads();
+        for (int j = tid; j < N / 4; j += blockDim.x) {
+            float4 temp_value = register_array[j];
+            temp_value.x = temp_value.x / sum;
+            temp_value.y = temp_value.y / sum;
+            temp_value.z = temp_value.z / sum;
+            temp_value.w = temp_value.w / sum;
+            out_start[j] = temp_value;
+        }
+    }
+    return;
+}
+
+// v5 使用寄存器 正确示范, 确定每个线程的寄存器数量, 基于寄存器进行循环
+template <int BlockSize, int ColSize>
+__global__ void learning_softmax_v5(float* in, float* out, int M, int N) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_index = tid / WarpSize;
+    constexpr int ElementPerThread = (ColSize / 4) / BlockSize;
+    // 只需要一个memory 使用两种用途
+    __shared__ float smem[BlockSize / WarpSize];
+    // ! 实际每个线程使用的寄存器数量
+    float4 register_array[ElementPerThread];
+    // 向量化处理的实际就少了
+    for (int index = bid; index < M; index += gridDim.x) {
+        // block 内的起始地址
+        float4* start = &(reinterpret_cast<float4*>(in)[index * N / 4]);
+        float4* out_start = &(reinterpret_cast<float4*>(out)[index * N / 4]);
+
+        float max_value = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < ElementPerThread; i++) {
+            int j = tid + BlockSize * i;
+            float4 temp_value = start[j];
+            max_value = fmax(temp_value.x, max_value);
+            max_value = fmax(temp_value.y, max_value);
+            max_value = fmax(temp_value.z, max_value);
+            max_value = fmax(temp_value.w, max_value);
+        }
+
+        max_value = learning_warp_level_max(max_value);
+
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = max_value;
+        }
+        __syncthreads();
+
+        max_value = (tid < BlockSize / WarpSize) ? smem[tid] : -INFINITY;
+        __syncthreads();
+        //! warp index == 0, 只有一个线程参与
+        if (warp_index == 0) {
+            max_value = learning_warp_level_max(max_value);
+            if (tid == 0) {
+                smem[tid] = max_value;
+            }
+        }
+        __syncthreads();
+        max_value = smem[0];
+        __syncthreads();
+        float sum{0.0};
+
+#pragma unroll
+        for (int i = 0; i < ElementPerThread; i++) {
+            int j = tid + BlockSize * i;
+            float4 temp_value = start[j];
+            float4 exp_value;
+            exp_value.x = std::exp(temp_value.x - max_value);
+            exp_value.y = std::exp(temp_value.y - max_value);
+            exp_value.z = std::exp(temp_value.z - max_value);
+            exp_value.w = std::exp(temp_value.w - max_value);
+            sum += exp_value.x + exp_value.y + exp_value.z + exp_value.w;
+            register_array[i] = exp_value;  // 暂存 exp 结果，写回阶段不再重算 exp
+        }
+
+        sum = learning_warp_level_sum(sum);
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = sum;
+        }
+        __syncthreads();
+
+        sum = (tid < BlockSize / WarpSize) ? smem[tid] : 0.0;
+        __syncthreads();
+        //! warp index == 0, 只有一个线程参与
+        if (warp_index == 0) {
+            sum = learning_warp_level_sum(sum);
+            if (tid == 0) {
+                smem[tid] = sum;
+            }
+        }
+
+        __syncthreads();
+        sum = smem[0];
+        __syncthreads();
+
+#pragma unroll
+        for (int i = 0; i < ElementPerThread; i++) {
+            int j = tid + BlockSize * i;
+            float4 temp_value = register_array[i];
+            temp_value.x = temp_value.x / sum;
+            temp_value.y = temp_value.y / sum;
+            temp_value.z = temp_value.z / sum;
+            temp_value.w = temp_value.w / sum;
+            out_start[j] = temp_value;
+        }
+    }
+    return;
+}
+
 // V0: 朴素实现，一个线程处理一行, 要求线程数量大于n
 __global__ void softmax_v0(float* in, float* out, int n, int m) {
     int gid = threadIdx.x + blockDim.x * blockIdx.x;
