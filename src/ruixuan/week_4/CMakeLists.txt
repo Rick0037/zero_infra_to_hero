@@ -272,7 +272,17 @@ target_link_libraries(
     14_1_self_quantize PUBLIC
     -lcudart
     -lcudadevrt)
-#15 gemv
+
+
+add_executable(14_1_self_learning_quantize
+    14_1_self_learning_quantize.cu
+)
+target_link_libraries(
+    14_1_self_learning_quantize PUBLIC
+    -lcudart
+    -lcudadevrt)
+
+    #15 gemv
 add_executable(15_1_gemv
     15_gemv/15_1_fp32_fp16_gemv.cu
 )
