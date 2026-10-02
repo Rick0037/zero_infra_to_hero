@@ -3,9 +3,181 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
+#include <cfloat>
 #include <cmath>
 
 #define WarpSize 32
+// 直接上最难得
+// 一个block 处理一个 行
+// 向量化得加载
+// one pass
+// 寄存器来展开循环
+// warp level + block 归约
+
+//! online max 全都得重新计算
+__device__ void warp_level_sum_and_max(float& max_val, float& sum_val) {
+    for (int i = 16; i > 0; i >>= 1) {
+        float temp_sum = __shfl_down_sync(0xffffffff, sum_val, i);
+        float temp_max = __shfl_down_sync(0xffffffff, max_val, i);
+
+        float new_max = fmax(temp_max, max_val);
+        sum_val = temp_sum * std::exp(temp_max - new_max) + sum_val * std::exp(max_val - new_max);
+        max_val = new_max;
+    }
+}
+
+template <int BlockSize>
+__global__ void learning_online_softmax_v0(float* in, float* out, int m, int n) {
+    // 一个block 处理一个 行
+    // 向量化得加载
+    // one pass
+    // 寄存器来展开循环
+    // warp level + block 归约
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_index = tid / WarpSize;
+    __shared__ float smem_max[BlockSize / WarpSize];
+    __shared__ float smem_sum[BlockSize / WarpSize];
+    for (int index = bid; index < m; index += gridDim.x) {
+        // 向量化加载
+        float4* start = &(reinterpret_cast<float4*>(in)[index * n / 4]);
+        float4* out_start = &(reinterpret_cast<float4*>(out)[index * n / 4]);
+
+        float sum{0.0};
+        float max_value = -FLT_MAX;  // 用有限大负数当初值，避免 identity 在归约中产生 NaN
+
+        for (int i = tid; i < n / 4; i += blockDim.x) {
+            float4 temp_value = start[i];
+            float comps[4] = {temp_value.x, temp_value.y, temp_value.z, temp_value.w};
+            float new_max_value;
+            for (int j = 0; j < 4; j++) {
+                new_max_value = fmax(max_value, comps[j]);
+                sum =
+                    sum * std::exp(max_value - new_max_value) + std::exp(comps[j] - new_max_value);
+                max_value = new_max_value;
+            }
+        }
+
+        // 每个线程得到了自己得sum 以及max value
+        warp_level_sum_and_max(max_value, sum);
+        if (thread_index_in_warp == 0) {
+            smem_max[warp_index] = max_value;
+            smem_sum[warp_index] = sum;
+        }
+        __syncthreads();
+
+        if (warp_index == 0) {
+            max_value =
+                (tid < BlockSize / WarpSize)
+                    ? smem_max[tid]
+                    : -FLT_MAX;  // identity 用有限值，两条 identity 相遇时 exp(0)=1 不产 NaN
+            sum = (tid < BlockSize / WarpSize) ? smem_sum[tid] : 0.0;
+            warp_level_sum_and_max(max_value, sum);
+        }
+
+        if (tid == 0) {
+            smem_max[0] = max_value;
+            smem_sum[0] = sum;
+        }
+        __syncthreads();
+
+        max_value = smem_max[0];
+        sum = smem_sum[0];
+        __syncthreads();
+
+        for (int i = tid; i < n / 4; i += blockDim.x) {
+            float4 temp_value = start[i];
+            float comps[4] = {temp_value.x, temp_value.y, temp_value.z, temp_value.w};
+            for (int j = 0; j < 4; j++) {
+                comps[j] = std::exp(comps[j] - max_value) / sum;
+            }
+            temp_value.x = comps[0];
+            temp_value.y = comps[1];
+            temp_value.z = comps[2];
+            temp_value.w = comps[3];
+            out_start[i] = temp_value;
+        }
+    }
+}
+
+template <int BlockSize, int N>
+__global__ void learning_online_softmax_one_pass(float* in, float* out, int m, int n) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_index = tid / WarpSize;
+    __shared__ float smem_max[BlockSize / WarpSize];
+    __shared__ float smem_sum[BlockSize / WarpSize];
+    constexpr int ElementPerThread = N / 4 / BlockSize;
+
+    float4 register_buffer[ElementPerThread];
+
+    for (int index = bid; index < m; index += gridDim.x) {
+        float4* start = &(reinterpret_cast<float4*>(in)[index * n / 4]);
+        float4* out_start = &(reinterpret_cast<float4*>(out)[index * n / 4]);
+
+        float sum{0.0};
+        float max_value = -FLT_MAX;  // 用有限大负数当初值，避免 identity 在归约中产生 NaN
+
+#pragma unroll
+        for (int i = 0; i < ElementPerThread; i++) {
+            int current_i = tid + blockDim.x * i;
+            float4 temp_value = start[current_i];
+            float comps[4] = {temp_value.x, temp_value.y, temp_value.z, temp_value.w};
+            float new_max_value;
+            for (int j = 0; j < 4; j++) {
+                new_max_value = fmax(max_value, comps[j]);
+                sum =
+                    sum * std::exp(max_value - new_max_value) + std::exp(comps[j] - new_max_value);
+                max_value = new_max_value;
+            }
+            register_buffer[i] = temp_value;
+        }
+
+        // 每个线程得到了自己得sum 以及max value
+        warp_level_sum_and_max(max_value, sum);
+        if (thread_index_in_warp == 0) {
+            smem_max[warp_index] = max_value;
+            smem_sum[warp_index] = sum;
+        }
+        __syncthreads();
+
+        if (warp_index == 0) {
+            max_value =
+                (tid < BlockSize / WarpSize)
+                    ? smem_max[tid]
+                    : -FLT_MAX;  // identity 用有限值，两条 identity 相遇时 exp(0)=1 不产 NaN
+            sum = (tid < BlockSize / WarpSize) ? smem_sum[tid] : 0.0;
+            warp_level_sum_and_max(max_value, sum);
+        }
+
+        if (tid == 0) {
+            smem_max[0] = max_value;
+            smem_sum[0] = sum;
+        }
+        __syncthreads();
+
+        max_value = smem_max[0];
+        sum = smem_sum[0];
+        __syncthreads();
+
+#pragma unroll
+        for (int i = 0; i < ElementPerThread; i++) {
+            float4 temp_value = register_buffer[i];
+            int current_i = tid + blockDim.x * i;
+            float comps[4] = {temp_value.x, temp_value.y, temp_value.z, temp_value.w};
+            for (int j = 0; j < 4; j++) {
+                comps[j] = std::exp(comps[j] - max_value) / sum;
+            }
+            temp_value.x = comps[0];
+            temp_value.y = comps[1];
+            temp_value.z = comps[2];
+            temp_value.w = comps[3];
+            out_start[current_i] = temp_value;
+        }
+    }
+}
 
 // online softmax 一个线程负责一行
 __global__ void online_softmax_v0(float* in, float* out, int m, int n) {
