@@ -128,6 +128,13 @@ target_link_libraries(
     reduce_v6 PUBLIC
     -lcudart
     -lcudadevrt)
+add_executable(reduce_v7
+    5_reduce/reduce_v7.cu
+)
+target_link_libraries(
+    reduce_v7 PUBLIC
+    -lcudart
+    -lcudadevrt)
 #6
 add_executable(6_warp_level_reduce
     6_warp_level_reduce.cu
