@@ -382,6 +382,47 @@ inline __device__ float4 fma(float a, float4 b, float4 c) {
 }
 }  // namespace gemv2
 
+//! 瞎起名THREADS_PER_VALUE, 实际上是pergroup
+template <int THREADS_PER_BLOCK, int THREADS_PER_GROUP, int PACKAGE_SIZE>
+__global__ void learning_gemv2_kernel(float* matrix, float* vector, float* res, int N, int M) {
+    int tid = threadIdx.x;
+    int row = tid / THREADS_PER_GROUP;
+    int col = tid % THREADS_PER_GROUP;
+
+    // 每行
+    constexpr int loop_iter = THREADS_PER_BLOCK / THREADS_PER_GROUP;
+
+    // on chinese
+    float4 out{0.0, 0.0, 0.0, 0.0};
+    // out  每个线程管理自己的位置
+    for (int i = row; i < N; i += loop_iter) {
+        // 直接定位到元素
+        float4 current_value = reinterpret_cast<float4*>(matrix)[i * THREADS_PER_GROUP + col];
+        float vector_value = vector[i];
+        out = gemv2::fma(vector_value, current_value, out);
+    }
+    __shared__ float4 smem[THREADS_PER_BLOCK];
+    smem[tid] = out;
+    __syncthreads();
+    //
+    // 直接 thread 内部归约
+    for (int j = loop_iter / 2; j > 0; j >>= 1) {
+        int active_thread = THREADS_PER_BLOCK / (loop_iter / j);
+
+        if (tid < active_thread) {
+            smem[tid] = gemv2::add(smem[tid], smem[tid + active_thread]);
+        }
+        __syncthreads();
+    }
+
+    //
+    if (tid < THREADS_PER_GROUP) {
+        // 最终只有 THREADS_PER_GROUP 个的smem有数值
+        reinterpret_cast<float4*>(res)[col] = smem[tid];
+    }
+    return;
+}
+
 // for fp32: <64, M * sizeof(T) / 16 = M / 4, 4>
 template <int THREADS_PER_BLOCK, int THREADS_PER_VALUE, int VEC_SIZE>
 __global__ void gemv2_kernel(float* matrix, float* vector, float* res, int N, int M) {
