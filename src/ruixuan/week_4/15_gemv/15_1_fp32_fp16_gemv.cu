@@ -55,6 +55,89 @@ bool CheckResult(float *out, float *groudtruth, int M) {
     return true;
 }
 
+void learning_gemv_kernel(half *vec, half *d_vec, half *mat, half *d_mat, half *dst, half *d_dst) {
+    constexpr int N = 2048;  // 256 * 8
+    constexpr int M = 256;
+
+    //    initialize<T>(vec, d_vec, mat, d_mat, dst, d_dst, M, N);
+    vec = (half *)malloc(N * sizeof(half));
+    cudaMalloc((void **)&d_vec, N * sizeof(half));
+
+    mat = (half *)malloc(M * N * sizeof(half));
+    cudaMalloc((void **)&d_mat, M * N * sizeof(half));
+
+    dst = (half *)malloc(M * sizeof(half));
+    //! dst 在 gemvCPU 里是 += 累加, 必须先清零
+    memset(dst, 0, M * sizeof(half));
+    cudaMalloc((void **)&d_dst, M * sizeof(half));
+
+    for (int i = 0; i < N; i++) {
+        vec[i] = (half)1;
+    }
+    for (int i = 0; i < N * M; i++) {
+        mat[i] = (half)1;
+    }
+
+    gemvCPU(mat, vec, dst, M, N);
+
+    cudaMemcpy(d_vec, vec, N * sizeof(half), cudaMemcpyHostToDevice);
+
+    cudaMemcpy(d_mat, mat, M * N * sizeof(half), cudaMemcpyHostToDevice);
+
+    constexpr int THREAD_NUMS = 256;
+    constexpr int VEC_SIZE = Vec<half>::size;
+    // constexpr int VECS_PER_THREAD = (N / THREAD_NUMS) / VEC_SIZE;  // 1 for half, 2 for fp32
+    // // *实际上是模板类种的静态函数, 中间必须有template
+    // DispatchLauncher<VECS_PER_THREAD, VEC_SIZE, THREAD_NUMS>::template launcher<T>(d_mat, d_vec,
+    //    d_dst, M, N);
+
+    dim3 Grid(M);
+    dim3 Block(THREAD_NUMS);
+    float milliseconds = 0;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    printf("calling\n");
+    learning_gemv<THREAD_NUMS, VEC_SIZE><<<Grid, Block>>>(d_mat, d_vec, d_dst, M, N);
+    cudaError_t result = cudaGetLastError();
+    if (result) {
+        throw std::runtime_error(std::string("[ERROR] CUDA runtime error: ") +
+                                 (_cudaGetErrorEnum(result)) + " " + __FILE__ + ":" +
+                                 std::to_string(__LINE__) + " \n");
+    }
+    printf("called\n");
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("gemv latency = %f ms\n", milliseconds);
+
+    CHECK(cudaMemcpy(dst, d_dst, M * sizeof(half), cudaMemcpyDeviceToHost));
+    bool is_right;
+    //! half: 参考用 float 累加, GPU 结果逐元素转 float 后按容差比较
+    float *groudtruth = (float *)malloc(sizeof(float) * M);
+    memset(groudtruth, 0, sizeof(float) * M);
+    gemvCPUHalf(mat, vec, groudtruth, M, N);
+    float *dst_f = (float *)malloc(sizeof(float) * M);
+    for (int i = 0; i < M; i++) {
+        dst_f[i] = __half2float(dst[i]);
+    }
+    is_right = CheckResultHalf(dst_f, groudtruth, M);
+    free(groudtruth);
+    free(dst_f);
+    if (is_right) {
+        printf("the ans is right\n");
+    } else {
+        printf("the ans is wrong\n");
+    }
+    cudaFree(d_vec);
+    cudaFree(d_mat);
+    cudaFree(d_dst);
+    free(vec);
+    free(mat);
+    free(dst);
+}
+
 template <typename T>
 void gemv_kernel(T *vec, T *d_vec, T *mat, T *d_mat, T *dst, T *d_dst) {
     constexpr int N = 2048;  // 256 * 8
@@ -130,7 +213,7 @@ template void gemv_kernel<float>(float *, float *, float *, float *, float *, fl
 template void gemv_kernel<half>(half *, half *, half *, half *, half *, half *);
 
 int main() {
-    if (false) {
+    if (true) {
         float *vec;
         float *d_vec;
         float *mat;
@@ -145,6 +228,7 @@ int main() {
         half *d_mat;
         half *dst;
         half *d_dst;
-        gemv_kernel<half>(vec, d_vec, mat, d_mat, dst, d_dst);
+        // gemv_kernel<half>(vec, d_vec, mat, d_mat, dst, d_dst);
+        learning_gemv_kernel(vec, d_vec, mat, d_mat, dst, d_dst);
     }
 }

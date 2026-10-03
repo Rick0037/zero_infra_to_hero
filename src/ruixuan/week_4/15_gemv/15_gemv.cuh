@@ -107,6 +107,69 @@ __global__ void gemv(float* matrix, float* vector, float* res, int cols) {
     }
 }
 
+__device__ float warp_level_sum_reduce(float sum_value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_value += __shfl_down_sync(0xffffffff, sum_value, offset);
+    }
+    return sum_value;
+}
+
+// block to m,
+template <int BLOCK_SIZE, int PACKAGE_SIZE>
+__global__ void learning_gemv(half* matrix, half* vector, half* res, int rows, int cols) {
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int warp_index = tid / 32;
+    int thread_index_in_warp = tid % 32;
+    __shared__ float smem[BLOCK_SIZE / 32];
+    for (int i = bid; i < rows; i += gridDim.x) {
+        // 当前行
+        float4* start = reinterpret_cast<float4*>(matrix) + i * cols / PACKAGE_SIZE;
+        float4* vect_start = reinterpret_cast<float4*>(vector);
+        // float4* res_start = reinterpret_cast<float4*>(res + bid);
+        half2 thread_sum_value{0.0, 0.0};
+        float4 temp_mat;
+        float4 temp_vec;
+        //* 可以线程内先求一波和, 一会儿来一波warp level + block level reduce
+        for (int j = tid; j < cols / PACKAGE_SIZE; j += blockDim.x) {
+            temp_mat = start[j];
+            temp_vec = vect_start[j];
+            half2* mat_val_1 = (half2*)&temp_mat.x;
+            half2* mat_val_2 = (half2*)&temp_mat.y;
+            half2* mat_val_3 = (half2*)&temp_mat.z;
+            half2* mat_val_4 = (half2*)&temp_mat.w;
+
+            half2* vec_val_1 = (half2*)&temp_vec.x;
+            half2* vec_val_2 = (half2*)&temp_vec.y;
+            half2* vec_val_3 = (half2*)&temp_vec.z;
+            half2* vec_val_4 = (half2*)&temp_vec.w;
+            thread_sum_value += __hmul2(*mat_val_1, *vec_val_1);
+            thread_sum_value += __hmul2(*mat_val_2, *vec_val_2);
+            thread_sum_value += __hmul2(*mat_val_3, *vec_val_3);
+            thread_sum_value += __hmul2(*mat_val_4, *vec_val_4);
+        }
+
+        float sum_value = thread_sum_value.x + thread_sum_value.y;
+        sum_value = warp_level_sum_reduce(sum_value);
+
+        if (thread_index_in_warp == 0) {
+            smem[warp_index] = sum_value;
+        }
+        __syncthreads();
+
+        if (warp_index == 0) {
+            sum_value = tid < BLOCK_SIZE / 32 ? smem[tid] : 0.0;
+            sum_value = warp_level_sum_reduce(sum_value);
+        }
+
+        if (tid == 0) {
+            res[i] = sum_value;
+        }
+        __syncthreads();  // !保护跨行迭代: 下一轮写 smem 前, 确保本轮 warp 0 已读完 smem
+    }
+    return;
+}
+
 template <int VECS_PER_THREAD, int VEC_SIZE>
 __global__ void gemv(half* matrix, half* vector, half* res, int cols) {
     int tid = threadIdx.x;
