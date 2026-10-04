@@ -107,6 +107,40 @@ __global__ void gemv(float* matrix, float* vector, float* res, int cols) {
     }
 }
 
+//* 对照组: 标量加载版, grid/block/归约与上面的 float4 版完全一致, 唯一区别是每次只 load 1 个 float
+__global__ void gemv_scalar(float* matrix, float* vector, float* res, int cols) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    float thread_local_sum = 0.0f;
+    // 每个线程标量遍历自己负责的列, 同样覆盖整行
+    for (int j = tid; j < cols; j += blockDim.x) {
+        thread_local_sum += matrix[bid * cols + j] * vector[j];
+    }
+    float reduce_res = blockReduce<SumOp, float>(thread_local_sum);
+    if (tid == 0) {
+        res[bid] = reduce_res;
+    }
+}
+
+//* 路线B: 一行沿列方向拆给多个 block, grid = (SPLIT, M)
+//* 每个 block 只算一行的一段列区间, 块内归约后 atomicAdd 合并; 启动前 res 必须清零
+__global__ void gemv_split(float* matrix, float* vector, float* res, int rows, int cols) {
+    int row = blockIdx.y;
+    int seg = blockIdx.x;
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x * gridDim.x;
+    int gid = seg * blockDim.x + tid;
+
+    float thread_local_sum = 0.0f;
+    for (int j = gid; j < cols; j += total_threads) {
+        thread_local_sum += matrix[row * cols + j] * vector[j];
+    }
+    float reduce_res = blockReduce<SumOp, float>(thread_local_sum);
+    if (tid == 0) {
+        atomicAdd(&res[row], reduce_res);
+    }
+}
+
 __device__ float warp_level_sum_reduce(float sum_value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum_value += __shfl_down_sync(0xffffffff, sum_value, offset);

@@ -140,7 +140,7 @@ void learning_gemv_kernel(half *vec, half *d_vec, half *mat, half *d_mat, half *
 
 template <typename T>
 void gemv_kernel(T *vec, T *d_vec, T *mat, T *d_mat, T *dst, T *d_dst) {
-    constexpr int N = 2048;  // 256 * 8
+    constexpr int N = 131072;  // 128MiB 矩阵, 超出 L2(72MiB); 每线程 512 标量 / 128 个 float4
     constexpr int M = 256;
 
     //    initialize<T>(vec, d_vec, mat, d_mat, dst, d_dst, M, N);
@@ -173,6 +173,102 @@ void gemv_kernel(T *vec, T *d_vec, T *mat, T *d_mat, T *dst, T *d_dst) {
     // *实际上是模板类种的静态函数, 中间必须有template
     DispatchLauncher<VECS_PER_THREAD, VEC_SIZE, THREAD_NUMS>::template launcher<T>(d_mat, d_vec,
                                                                                    d_dst, M, N);
+
+    //! 仅 fp32: 向量化(float4) vs 标量(float) 对照, grid/block/归约完全相同, 只改加载宽度
+    if constexpr (std::is_same_v<T, float>) {
+        T *d_dst_scalar = nullptr;
+        cudaMalloc((void **)&d_dst_scalar, M * sizeof(T));
+
+        constexpr int WARMUP = 10;
+        constexpr int ITERS = 100;
+        for (int k = 0; k < WARMUP; k++) {
+            gemv<VECS_PER_THREAD, VEC_SIZE><<<M, THREAD_NUMS>>>(d_mat, d_vec, d_dst, N);
+            gemv_scalar<<<M, THREAD_NUMS>>>(d_mat, d_vec, d_dst_scalar, N);
+        }
+        cudaDeviceSynchronize();
+
+        cudaEvent_t vs, ve, ss, se;
+        cudaEventCreate(&vs);
+        cudaEventCreate(&ve);
+        cudaEventCreate(&ss);
+        cudaEventCreate(&se);
+
+        cudaEventRecord(vs);
+        for (int k = 0; k < ITERS; k++) {
+            gemv<VECS_PER_THREAD, VEC_SIZE><<<M, THREAD_NUMS>>>(d_mat, d_vec, d_dst, N);
+        }
+        cudaEventRecord(ve);
+
+        cudaEventRecord(ss);
+        for (int k = 0; k < ITERS; k++) {
+            gemv_scalar<<<M, THREAD_NUMS>>>(d_mat, d_vec, d_dst_scalar, N);
+        }
+        cudaEventRecord(se);
+
+        cudaEventSynchronize(ve);
+        cudaEventSynchronize(se);
+        float t_vec = 0, t_scalar = 0;
+        cudaEventElapsedTime(&t_vec, vs, ve);
+        cudaEventElapsedTime(&t_scalar, ss, se);
+        printf("vectorized(float4) avg latency = %f ms\n", t_vec / ITERS);
+        printf("scalar(float)      avg latency = %f ms, speedup = %.2fx\n", t_scalar / ITERS,
+               t_scalar / t_vec);
+
+        // 此时 dst 里还是 CPU 参考结果, 直接校验标量版
+        T *scalar_host = (T *)malloc(M * sizeof(T));
+        CHECK(cudaMemcpy(scalar_host, d_dst_scalar, M * sizeof(T), cudaMemcpyDeviceToHost));
+        bool scalar_right = true;
+        for (int k = 0; k < M; k++) {
+            if (scalar_host[k] != dst[k]) {
+                printf("scalar %dth res is wrong: %f and %f\n", k, scalar_host[k], dst[k]);
+                scalar_right = false;
+                break;
+            }
+        }
+        printf("scalar kernel ans is %s\n", scalar_right ? "right" : "wrong");
+
+        //! 路线B: 一行拆 SPLIT 个 block (grid=SPLIT*M=768), occupancy 可到 100%; atomicAdd
+        //! 前必须清零
+        constexpr int SPLIT = 3;
+        dim3 split_grid(SPLIT, M);
+        for (int k = 0; k < WARMUP; k++) {
+            cudaMemset(d_dst, 0, M * sizeof(T));
+            gemv_split<<<split_grid, THREAD_NUMS>>>(d_mat, d_vec, d_dst, M, N);
+        }
+        cudaDeviceSynchronize();
+
+        cudaEventRecord(ss);
+        for (int k = 0; k < ITERS; k++) {
+            cudaMemset(d_dst, 0, M * sizeof(T));  // 若分离计时可把 memset 挪出, 这里保守保证正确
+            gemv_split<<<split_grid, THREAD_NUMS>>>(d_mat, d_vec, d_dst, M, N);
+        }
+        cudaEventRecord(se);
+        cudaEventSynchronize(se);
+        float t_split = 0;
+        cudaEventElapsedTime(&t_split, ss, se);
+        printf("split(3 blocks/row) avg latency = %f ms, vs float4 speedup = %.2fx\n",
+               t_split / ITERS, t_vec / t_split);
+
+        T *split_host = (T *)malloc(M * sizeof(T));
+        CHECK(cudaMemcpy(split_host, d_dst, M * sizeof(T), cudaMemcpyDeviceToHost));
+        bool split_right = true;
+        for (int k = 0; k < M; k++) {
+            if (split_host[k] != dst[k]) {
+                printf("split %dth res is wrong: %f and %f\n", k, split_host[k], dst[k]);
+                split_right = false;
+                break;
+            }
+        }
+        printf("split kernel ans is %s\n", split_right ? "right" : "wrong");
+
+        free(split_host);
+        free(scalar_host);
+        cudaFree(d_dst_scalar);
+        cudaEventDestroy(vs);
+        cudaEventDestroy(ve);
+        cudaEventDestroy(ss);
+        cudaEventDestroy(se);
+    }
 
     CHECK(cudaMemcpy(dst, d_dst, M * sizeof(T), cudaMemcpyDeviceToHost));
     bool is_right;
