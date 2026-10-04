@@ -11,6 +11,10 @@
 
 #define WarpSize 32
 #define M 1024
+
+// *------N dispatch------
+
+// #define N 512
 #define N 4096
 // #define N 16384
 
@@ -250,6 +254,57 @@ __global__ void QuantizePerTokenSymmetric(int m, int n, const float* d_in, float
     return;
 }
 
+template <int BlockSize>
+__global__ void GemvHalf(int m, int n, const half* d_mat, const half* d_vec, half* d_out) {
+    // gemv（W4A16 之前的热身）：y = A · x，A shape [4096, 4096] fp16，x [4096]，一个 warp/block
+    // 负责若干行，用 float4/half2 向量化访存
+    // 先乘积, 乘积之后进行reduce
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_idx = tid / WarpSize;
+    const float4* vec_start = reinterpret_cast<const float4*>(d_vec);
+    __shared__ float smem_gemv[BlockSize];
+    for (int index = bid; index < m; index += gridDim.x) {
+        //* 读取还是使用float4, 实际计算还是使用half2
+        const float4* start = reinterpret_cast<const float4*>(d_mat) + index * n / 8;
+        half2 thread_local_sum_value{0.0, 0.0};
+        for (int j = tid; j < n / 8; j += blockDim.x) {
+            float4 temp_value = start[j];
+            float4 temp_vec_value = vec_start[j];
+            //! half2 * half2 -> half2  __hmul2
+            thread_local_sum_value +=
+                __hmul2(*(half2*)(&temp_value.x), *(half2*)(&temp_vec_value.x));
+            thread_local_sum_value +=
+                __hmul2(*(half2*)(&temp_value.y), *(half2*)(&temp_vec_value.y));
+            thread_local_sum_value +=
+                __hmul2(*(half2*)(&temp_value.z), *(half2*)(&temp_vec_value.z));
+            thread_local_sum_value +=
+                __hmul2(*(half2*)(&temp_value.w), *(half2*)(&temp_vec_value.w));
+        }
+        float sum = thread_local_sum_value.x + thread_local_sum_value.y;
+
+        sum = warp_level_sum(sum);
+
+        if (thread_index_in_warp == 0) {
+            smem_gemv[warp_idx] = sum;
+        }
+        __syncthreads();
+
+        if (warp_idx == 0) {
+            sum = (tid < blockDim.x / WarpSize) ? smem_gemv[tid] : 0.0;
+            sum = warp_level_sum(sum);
+        }
+        if (tid == 0) {
+            smem_gemv[tid] = sum;
+            d_out[index] = (half)sum;
+        }
+        __syncthreads();
+    }
+
+    return;
+}
+
 // ---------------------------------------------------------
 void SoftmaxTest(int m, const int n) {
     printf("=======SoftmaxTest=======\n");
@@ -395,6 +450,9 @@ void GemvTest(int m, int n) {
     printf("=======GemvTest=======\n");
     // 3. gemv（W4A16 之前的热身）：y = A · x，A shape [4096, 4096] fp16，x [4096]，一个 warp/block
     // 负责若干行，用 float4/half2 向量化访存。与 torch.mv 对齐 rtol=1e-2。
+    constexpr int BlockSize = 256;
+    dim3 block(BlockSize);
+    dim3 grid(m);
     const size_t a_bytes = (size_t)m * n * sizeof(half);
     const size_t x_bytes = (size_t)n * sizeof(half);
     const size_t y_bytes = (size_t)m * sizeof(half);
@@ -419,15 +477,14 @@ void GemvTest(int m, int n) {
     cudaEventCreate(&stop);
     float ms = 0.0f;
 
-    // TODO: 实现 kernel 后, 把下面两处 launch 取消注释
-    // 一个 warp 负责一行, block = 256(8 个 warp) -> grid = m / 8
+    // 一个 block 负责一行, block = 256(8 个 warp) -> grid = m / 8
     for (int i = 0; i < WARMUP; i++) {
-        // GemvHalf
+        GemvHalf<BlockSize><<<grid, block>>>(m, n, d_A, d_x, d_y);
     }
     cudaDeviceSynchronize();
     cudaEventRecord(start);
     for (int i = 0; i < ITERS; i++) {
-        // GemvHalf
+        GemvHalf<BlockSize><<<grid, block>>>(m, n, d_A, d_x, d_y);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -449,7 +506,7 @@ void GemvTest(int m, int n) {
     free(h_gt);
 }
 
-void FuseQuantSoftamxTest() {
+void FuseSoftamxAndQuantTest() {
     // 可选加分：把 quantize kernel 融合进 softmax 的输出端（softmax→int8
     // 一次写回），对比融合前后的总耗时，说明省掉了几次 HBM 往返。
     return;
@@ -463,6 +520,6 @@ int main() {
     //----------------------
     GemvTest(N, N);
     //----------------------
-    FuseQuantSoftamxTest();
+    FuseSoftamxAndQuantTest();
     return 0;
 }
