@@ -60,6 +60,30 @@ __global__ void FP32FLOPS(int *start, int *stop, float *x, float *y, float *resu
     asm volatile("mov.u32 %0, %%clock;" : "=r"(stop_time)::"memory");
     start[gtid] = start_time;
     stop[gtid] = stop_time;
+
+    result[gtid] = res;
+}
+
+//* fp16 CUDA Core 峰值: 一条 __hfma2 同时对 2 个 half 做乘加 = 4 FLOPs
+__global__ void FP16FLOPS(int *start, int *stop, half2 *x, half2 *y, half2 *result) {
+    int gtid = blockDim.x * blockIdx.x + threadIdx.x;
+    half2 d1 = x[gtid];
+    half2 d2 = y[gtid];
+    half2 res = __float2half2_rn(0.0f);  //! 必须显式清零, 否则栈上垃圾导致 inf/nan
+    int start_time = 0;
+    asm volatile("mov.u32 %0, %%clock;" : "=r"(start_time)::"memory");
+    for (int i = 0; i < LOOP_TIMES; i++) {
+        //! 必须用 __hfma2 单指令 FMA; res += d1*d2 会退化成 HMUL2+HADD2 两条指令
+        res = __hfma2(d1, d2, res);
+        res = __hfma2(d1, d2, res);
+        res = __hfma2(d1, d2, res);
+        res = __hfma2(d1, d2, res);
+    }
+    asm volatile("bar.sync 0;");
+    int stop_time = 0;
+    asm volatile("mov.u32 %0, %%clock;" : "=r"(stop_time)::"memory");
+    start[gtid] = start_time;
+    stop[gtid] = stop_time;
     result[gtid] = res;
 }
 
@@ -101,17 +125,52 @@ int main() {
     printf("ThreadsPerSM is %ld, maxThreadsPerBlock is %ld \n", ThreadsPerSM,
            props.maxThreadsPerBlock);
     float FLOPS = (LOOP_TIMES * 4 * 2 * 1024) / (static_cast<float>(stopClock[0] - startClock[0]));
+    //* props.clockRate 的单位不是 Hz，而是 kHz
     printf("  GPU Max Clock rate: %0.2f GHz\n", props.clockRate * 1e-6f);
     printf(" SM counts is %d \n", props.multiProcessorCount);
-    printf("actual %s peak FLOPS is %f (TFLOPS) \n", props.name,
+    printf("actual %s fp32 peak FLOPS is %f (TFLOPS) \n", props.name,
            FLOPS * props.clockRate * 1e-9 * props.multiProcessorCount);
     free(x);
     free(y);
-    free(startClock);
-    free(stopClock);
     cudaFree(d_x);
     cudaFree(d_y);
     cudaFree(d_result);
+    //! startClock/stopClock 和 d_startClock/d_stopClock 还要给 fp16 段复用, 不能在这里释放
+
+    //* ---- fp16 CUDA Core 峰值 (half2 FMA) ----
+    half2 *hx = (half2 *)malloc(N * sizeof(half2));
+    half2 *hy = (half2 *)malloc(N * sizeof(half2));
+    half2 *d_hx;
+    half2 *d_hy;
+    half2 *d_hresult;
+    cudaMalloc((void **)&d_hx, N * sizeof(half2));
+    cudaMalloc((void **)&d_hy, N * sizeof(half2));
+    cudaMalloc((void **)&d_hresult, N * sizeof(half2));
+    // 填 1: 每线程累计 LOOP*4 = 4000, 不超 half 上限 65504
+    for (int i = 0; i < N; i++) {
+        hx[i] = __float2half2_rn(1.0f);
+        hy[i] = __float2half2_rn(1.0f);
+    }
+    cudaMemcpy(d_hx, hx, N * sizeof(half2), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hy, hy, N * sizeof(half2), cudaMemcpyHostToDevice);
+
+    FP16FLOPS<<<1, 1024>>>(d_startClock, d_stopClock, d_hx, d_hy, d_hresult);
+    cudaMemcpy(startClock, d_startClock, N * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(stopClock, d_stopClock, N * sizeof(int), cudaMemcpyDeviceToHost);
+
+    //* 一条 __hfma2 = 2 half 乘 + 2 half 加 = 4 FLOPs
+    float FP16_FLOPS =
+        (LOOP_TIMES * 4 * 4 * 1024) / (static_cast<float>(stopClock[0] - startClock[0]));
+    printf("actual %s fp16 (CUDA core, half2) peak FLOPS is %f (TFLOPS) \n", props.name,
+           FP16_FLOPS * props.clockRate * 1e-9 * props.multiProcessorCount);
+
+    free(hx);
+    free(hy);
+    free(startClock);
+    free(stopClock);
+    cudaFree(d_hx);
+    cudaFree(d_hy);
+    cudaFree(d_hresult);
     cudaFree(d_startClock);
     cudaFree(d_stopClock);
 }
