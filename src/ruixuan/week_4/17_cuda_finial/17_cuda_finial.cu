@@ -12,7 +12,6 @@
 #define WarpSize 32
 #define M 1024
 #define N 4096
-
 // #define N 16384
 
 __device__ float warp_level_sum(float sum) {
@@ -175,6 +174,83 @@ __global__ void SoftmaxOnline(int m, int n, float* d_in, float* d_out) {
     return;
 }
 
+__device__ __forceinline__ float getnearbyint(float val) { return std::nearbyint(val); }
+
+__device__ int8_t scaleandclip(float value, float scale, int8_t max_int8, int8_t min_int8) {
+    float temp_value = getnearbyint(value / scale);
+    temp_value = (temp_value > max_int8) ? max_int8 : temp_value;
+    temp_value = (temp_value < min_int8) ? min_int8 : temp_value;
+    return (int8_t)temp_value;
+}
+
+template <int BlockSize, int ColNumber>
+__global__ void QuantizePerTokenSymmetric(int m, int n, const float* d_in, float* d_scale,
+                                          int8_t* d_out, int8_t max_int8, int8_t min_int8) {
+    // per-token 对称 INT8 quantize kernel：输入 [m=1024, n=4096]
+    // absmax→scale=absmax/127→round+clip
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_idx = tid / WarpSize;
+    constexpr int ThreadLoopCount = (ColNumber / 4) / BlockSize;
+
+    __shared__ float smem_quant[BlockSize];
+    __shared__ float shared_scale;
+    //
+    for (int index = bid; index < m; index += gridDim.x) {
+        float max_value = -FLT_MAX;
+        float min_value = FLT_MAX;
+        const float4* start = reinterpret_cast<const float4*>(d_in) + index * n / 4;
+        char4* q_out = reinterpret_cast<char4*>(d_out) + index * n / 4;
+        float4 temp_value_array[ThreadLoopCount];
+#pragma unroll
+        for (int i = 0; i < ThreadLoopCount; i++) {
+            int j = tid + i * BlockSize;
+            temp_value_array[i] = start[j];
+            max_value = fmax(temp_value_array[i].x, max_value);
+            max_value = fmax(temp_value_array[i].y, max_value);
+            max_value = fmax(temp_value_array[i].z, max_value);
+            max_value = fmax(temp_value_array[i].w, max_value);
+            min_value = fmin(temp_value_array[i].x, min_value);
+            min_value = fmin(temp_value_array[i].y, min_value);
+            min_value = fmin(temp_value_array[i].z, min_value);
+            min_value = fmin(temp_value_array[i].w, min_value);
+        }
+        max_value = fmax(fabsf(min_value), fabsf(max_value));
+
+        max_value = warp_level_max(max_value);
+        if (thread_index_in_warp == 0) {
+            smem_quant[warp_idx] = max_value;
+        }
+        __syncthreads();
+
+        if (warp_idx == 0) {
+            max_value = (tid < blockDim.x / WarpSize) ? smem_quant[tid] : -FLT_MAX;
+            max_value = warp_level_max(max_value);
+        }
+        if (tid == 0) {
+            smem_quant[tid] = max_value;
+            shared_scale = max_value / max_int8;  // 赋值
+            d_scale[index] = shared_scale;
+        }
+        __syncthreads();
+        //* 自己yy的写法, 看看对不对
+#pragma unroll
+        for (int i = 0; i < ThreadLoopCount; i++) {
+            int j = tid + i * BlockSize;
+            float4 temp_value = temp_value_array[i];
+            char4 q = make_char4(scaleandclip(temp_value.x, shared_scale, max_int8, min_int8),
+                                 scaleandclip(temp_value.y, shared_scale, max_int8, min_int8),
+                                 scaleandclip(temp_value.z, shared_scale, max_int8, min_int8),
+                                 scaleandclip(temp_value.w, shared_scale, max_int8, min_int8));
+            // 赋值
+            q_out[j] = q;
+        }
+    }
+    return;
+}
+
+// ---------------------------------------------------------
 void SoftmaxTest(int m, const int n) {
     printf("=======SoftmaxTest=======\n");
     // 1. online safe softmax：输入 [m=1024, n=4096] fp32，实现两版 —— (a) baseline 三遍
@@ -252,6 +328,9 @@ void QuantizedTest(int m, int n) {
     // 2. per-token 对称 INT8 quantize kernel：输入 [m=1024, n=4096]，每行算
     // absmax→scale=absmax/127→round+clip，输出 int8 张量 + fp32 scale 数组。与 numpy reference
     // 逐元素比对（允许 ±1 个量化级差）。
+    constexpr int BlockSize = 256;
+    dim3 block(BlockSize);
+    dim3 grid(m);
     const size_t f_bytes = (size_t)m * n * sizeof(float);
     const size_t i8_bytes = (size_t)m * n * sizeof(int8_t);
     const size_t s_bytes = (size_t)m * sizeof(float);
@@ -278,14 +357,15 @@ void QuantizedTest(int m, int n) {
     cudaEventCreate(&stop);
     float ms = 0.0f;
 
-    // TODO: 实现 kernel 后, 把下面两处 launch 取消注释
     for (int i = 0; i < WARMUP; i++) {
-        // QuantizePerTokenSymmetric
+        QuantizePerTokenSymmetric<BlockSize, N>
+            <<<grid, block>>>(m, n, d_in, d_scale, d_q, 127, -128);
     }
     cudaDeviceSynchronize();
     cudaEventRecord(start);
     for (int i = 0; i < ITERS; i++) {
-        // QuantizePerTokenSymmetric
+        QuantizePerTokenSymmetric<BlockSize, N>
+            <<<grid, block>>>(m, n, d_in, d_scale, d_q, 127, -128);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
