@@ -305,3 +305,12 @@ target_link_libraries(
     16_dropout PUBLIC
     -lcudart
     -lcudadevrt)
+
+#17 cuda finial
+add_executable(17_cuda_finial
+    17_cuda_finial/17_cuda_finial.cu
+)
+target_link_libraries(
+    17_cuda_finial PUBLIC
+    -lcudart
+    -lcudadevrt)
