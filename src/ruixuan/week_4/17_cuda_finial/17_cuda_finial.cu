@@ -312,6 +312,8 @@ void SoftmaxTest(int m, const int n) {
     // pass（max→sum→normalize），一个 block 处理一行；(b) online 单 pass 版（flash attention 的
     // online softmax 递推）。与 torch.softmax(dim=-1) 对齐 atol=1e-4。
     constexpr int BlockSize = 256;
+    // constexpr int BlockSize = 128;
+
     dim3 block(BlockSize);
     dim3 grid(m);
     const size_t bytes = (size_t)m * n * sizeof(float);
@@ -334,40 +336,80 @@ void SoftmaxTest(int m, const int n) {
     float ms = 0.0f;
 
     // ---- (a) baseline 三遍 pass ----
-    for (int i = 0; i < WARMUP; i++) {
+    for (int i = 0; i < g_warmup; i++) {
         SoftmaxBaseline<<<grid, block, (block.x / WarpSize) * sizeof(float)>>>(m, n, d_in, d_out);
     }
     cudaDeviceSynchronize();
-    cudaEventRecord(start);
-    for (int i = 0; i < ITERS; i++) {
-        SoftmaxBaseline<<<grid, block, (block.x / WarpSize) * sizeof(float)>>>(m, n, d_in, d_out);
+    ms = 0.0f;
+    if (g_flush_buf == nullptr) {
+        // 热模式: 连续 launch 一起计时, launch 间隙被流水线掩盖
+        cudaEventRecord(start);
+        for (int i = 0; i < ITERS; i++) {
+            SoftmaxBaseline<<<grid, block, (block.x / WarpSize) * sizeof(float)>>>(m, n, d_in,
+                                                                                   d_out);
+        }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+    } else {
+        // 冷模式: 每次 launch 前冲 L2; start 事件在 memset 之后入队, memset 不计入时间
+        for (int i = 0; i < ITERS; i++) {
+            flush_l2();
+            cudaEventRecord(start);
+            SoftmaxBaseline<<<grid, block, (block.x / WarpSize) * sizeof(float)>>>(m, n, d_in,
+                                                                                   d_out);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float one = 0.0f;
+            cudaEventElapsedTime(&one, start, stop);
+            ms += one;
+        }
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&ms, start, stop);
     printf("baseline(3-pass) avg = %.4f ms\n", ms / ITERS);
+    // DRAM 流量: 1R+1W = 2*bytes(第 2/3 遍 pass 读的是 L2 里的输入)
+    // FLOPs: max 1 + sum 3 + norm 2 = 6/元素
+    print_perf("softmax baseline", 2.0 * bytes, 6.0 * m * n, ms / ITERS, 0);
 
     CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
-    int bad = check_softmax_res(m, n, h_out, h_gt);
-    printf("baseline mismatch = %d / %d\n", bad, m * n);
+    dump_bin("softmax_baseline.bin", h_out, bytes);
+    float max_err = 0.0f;
+    int bad = check_softmax_res(m, n, h_out, h_gt, &max_err);
+    printf("baseline mismatch = %d / %d, max_abs_err = %.3e\n", bad, m * n, max_err);
 
     // ---- (b) online 单 pass ----
-    for (int i = 0; i < WARMUP; i++) {
+    for (int i = 0; i < g_warmup; i++) {
         SoftmaxOnline<BlockSize, N><<<grid, block>>>(m, n, d_in, d_out);
     }
     cudaDeviceSynchronize();
-    cudaEventRecord(start);
-    for (int i = 0; i < ITERS; i++) {
-        SoftmaxOnline<BlockSize, N><<<grid, block>>>(m, n, d_in, d_out);
+    ms = 0.0f;
+    if (g_flush_buf == nullptr) {
+        cudaEventRecord(start);
+        for (int i = 0; i < ITERS; i++) {
+            SoftmaxOnline<BlockSize, N><<<grid, block>>>(m, n, d_in, d_out);
+        }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+    } else {
+        for (int i = 0; i < ITERS; i++) {
+            flush_l2();
+            cudaEventRecord(start);
+            SoftmaxOnline<BlockSize, N><<<grid, block>>>(m, n, d_in, d_out);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float one = 0.0f;
+            cudaEventElapsedTime(&one, start, stop);
+            ms += one;
+        }
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&ms, start, stop);
     printf("online(1-pass) avg = %.4f ms\n", ms / ITERS);
+    // DRAM 流量: 1R+1W = 2*bytes; FLOPs: 递推摊每元素 ~2 + norm 3 = 4
+    print_perf("softmax online", 2.0 * bytes, 4.0 * m * n, ms / ITERS, 0);
 
     CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
-    bad = check_softmax_res(m, n, h_out, h_gt);
-    printf("online mismatch = %d / %d\n", bad, m * n);
+    dump_bin("softmax_online.bin", h_out, bytes);
+    bad = check_softmax_res(m, n, h_out, h_gt, &max_err);
+    printf("online mismatch = %d / %d, max_abs_err = %.3e\n", bad, m * n, max_err);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -384,6 +426,8 @@ void QuantizedTest(int m, int n) {
     // absmax→scale=absmax/127→round+clip，输出 int8 张量 + fp32 scale 数组。与 numpy reference
     // 逐元素比对（允许 ±1 个量化级差）。
     constexpr int BlockSize = 256;
+    // constexpr int BlockSize = 128;
+
     dim3 block(BlockSize);
     dim3 grid(m);
     const size_t f_bytes = (size_t)m * n * sizeof(float);
@@ -412,27 +456,49 @@ void QuantizedTest(int m, int n) {
     cudaEventCreate(&stop);
     float ms = 0.0f;
 
-    for (int i = 0; i < WARMUP; i++) {
+    for (int i = 0; i < g_warmup; i++) {
         QuantizePerTokenSymmetric<BlockSize, N>
             <<<grid, block>>>(m, n, d_in, d_scale, d_q, 127, -128);
     }
     cudaDeviceSynchronize();
-    cudaEventRecord(start);
-    for (int i = 0; i < ITERS; i++) {
-        QuantizePerTokenSymmetric<BlockSize, N>
-            <<<grid, block>>>(m, n, d_in, d_scale, d_q, 127, -128);
+    ms = 0.0f;
+    if (g_flush_buf == nullptr) {
+        cudaEventRecord(start);
+        for (int i = 0; i < ITERS; i++) {
+            QuantizePerTokenSymmetric<BlockSize, N>
+                <<<grid, block>>>(m, n, d_in, d_scale, d_q, 127, -128);
+        }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+    } else {
+        for (int i = 0; i < ITERS; i++) {
+            flush_l2();
+            cudaEventRecord(start);
+            QuantizePerTokenSymmetric<BlockSize, N>
+                <<<grid, block>>>(m, n, d_in, d_scale, d_q, 127, -128);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float one = 0.0f;
+            cudaEventElapsedTime(&one, start, stop);
+            ms += one;
+        }
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&ms, start, stop);
     printf("per-token int8 quantize avg = %.4f ms\n", ms / ITERS);
+    // DRAM 流量: 读 fp32 输入 + 写 int8 输出 + 每行一个 scale
+    // FLOPs: fabs/fmax 归约 ~1 + div 1 + round 1 = 3/元素(取整和比较各算 1)
+    print_perf("quantize", f_bytes + i8_bytes + s_bytes, 3.0 * m * n, ms / ITERS, 0);
 
     CHECK(cudaMemcpy(h_q, d_q, i8_bytes, cudaMemcpyDeviceToHost));
-    int bad_q = check_quantize_res(m, n, h_q, h_q_gt);
-    printf("quantize mismatch = %d / %d\n", bad_q, m * n);
+    dump_bin("quant_out.bin", h_q, i8_bytes);
+    int max_err_q = 0;
+    int bad_q = check_quantize_res(m, n, h_q, h_q_gt, &max_err_q);
+    printf("quantize mismatch = %d / %d, max_err = %d\n", bad_q, m * n, max_err_q);
     CHECK(cudaMemcpy(h_scale, d_scale, s_bytes, cudaMemcpyDeviceToHost));
-    int bad_s = check_scale_res(m, h_scale, h_scale_gt);
-    printf("scale mismatch = %d / %d\n", bad_s, m);
+    dump_bin("scale_out.bin", h_scale, s_bytes);
+    float max_err_s = 0.0f;
+    int bad_s = check_scale_res(m, h_scale, h_scale_gt, &max_err_s);
+    printf("scale mismatch = %d / %d, max_abs_err = %.3e\n", bad_s, m, max_err_s);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -451,6 +517,7 @@ void GemvTest(int m, int n) {
     // 3. gemv（W4A16 之前的热身）：y = A · x，A shape [4096, 4096] fp16，x [4096]，一个 warp/block
     // 负责若干行，用 float4/half2 向量化访存。与 torch.mv 对齐 rtol=1e-2。
     constexpr int BlockSize = 256;
+    // constexpr int BlockSize = 128;
     dim3 block(BlockSize);
     dim3 grid(m);
     const size_t a_bytes = (size_t)m * n * sizeof(half);
@@ -478,22 +545,41 @@ void GemvTest(int m, int n) {
     float ms = 0.0f;
 
     // 一个 block 负责一行, block = 256(8 个 warp) -> grid = m / 8
-    for (int i = 0; i < WARMUP; i++) {
+    for (int i = 0; i < g_warmup; i++) {
         GemvHalf<BlockSize><<<grid, block>>>(m, n, d_A, d_x, d_y);
     }
     cudaDeviceSynchronize();
-    cudaEventRecord(start);
-    for (int i = 0; i < ITERS; i++) {
-        GemvHalf<BlockSize><<<grid, block>>>(m, n, d_A, d_x, d_y);
+    ms = 0.0f;
+    if (g_flush_buf == nullptr) {
+        cudaEventRecord(start);
+        for (int i = 0; i < ITERS; i++) {
+            GemvHalf<BlockSize><<<grid, block>>>(m, n, d_A, d_x, d_y);
+        }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+    } else {
+        for (int i = 0; i < ITERS; i++) {
+            flush_l2();
+            cudaEventRecord(start);
+            GemvHalf<BlockSize><<<grid, block>>>(m, n, d_A, d_x, d_y);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float one = 0.0f;
+            cudaEventElapsedTime(&one, start, stop);
+            ms += one;
+        }
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&ms, start, stop);
     printf("gemv [%d, %d] fp16 avg = %.4f ms\n", m, n, ms / ITERS);
+    // DRAM 流量: 读矩阵 + 读向量 + 写结果; FLOPs: MAC = mul+add = 2*m*n
+    print_perf("gemv", a_bytes + x_bytes + y_bytes, 2.0 * m * n, ms / ITERS, 1);
 
     CHECK(cudaMemcpy(h_y, d_y, y_bytes, cudaMemcpyDeviceToHost));
-    int bad = check_gemv_res(m, h_y, h_gt);
-    printf("gemv mismatch = %d / %d\n", bad, m);
+    dump_bin("gemv_y.bin", h_y, y_bytes);
+    float max_abs_err = 0.0f, max_rel_err = 0.0f;
+    int bad = check_gemv_res(m, h_y, h_gt, &max_abs_err, &max_rel_err);
+    printf("gemv mismatch = %d / %d, max_abs_err = %.3e, max_rel_err = %.3e\n", bad, m, max_abs_err,
+           max_rel_err);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -512,7 +598,22 @@ void FuseSoftamxAndQuantTest() {
     return;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    init_peak_info();
+    // 用法: ./17_cuda_finial [--dump] [--cold]
+    //   --dump: 把 GPU 输出写成 bin, 之后跑 compare_ref.py 出对齐表
+    //   --cold: 跳过预热, 每次计时 launch 前 memset 冲掉 L2, 测真实 DRAM 带宽
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--dump") == 0) {
+            g_dump_bin = 1;
+        } else if (strcmp(argv[i], "--cold") == 0) {
+            g_warmup = 0;
+            CHECK(cudaMalloc((void**)&g_flush_buf, g_flush_bytes));
+            CHECK(cudaMemset(g_flush_buf, 0, g_flush_bytes));
+            cudaDeviceSynchronize();
+        }
+    }
+
     //----------------------
     SoftmaxTest(M, N);
     //----------------------
@@ -521,5 +622,8 @@ int main() {
     GemvTest(N, N);
     //----------------------
     FuseSoftamxAndQuantTest();
+    if (g_flush_buf != nullptr) {
+        CHECK(cudaFree(g_flush_buf));
+    }
     return 0;
 }
