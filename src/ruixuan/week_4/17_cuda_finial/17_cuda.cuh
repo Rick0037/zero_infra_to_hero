@@ -62,19 +62,21 @@ PeakInfo g_peak;
 void init_peak_info() {
     cudaDeviceProp prop;
     CHECK(cudaGetDeviceProperties(&prop, 0));
-    int clock_khz = 0;
+    // 频率用 cudaDeviceGetAttribute 查, 不用 cudaDeviceProp 的 memoryClockRate/clockRate
+    // 字段(那两个在 CUDA 13 里已删除)
+    int clock_khz = 0, mem_clock_khz = 0;
     CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0));
+    CHECK(cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, 0));
 
     // API 查不到每 SM 的 CUDA core 数, 按计算能力给: Ampere 及以后 128, Volta/Turing 64
     int cores_per_sm = (prop.major >= 8) ? 128 : 64;
 
-    g_peak.bw_gbps = 2.0 * prop.memoryClockRate * 1e3 * (prop.memoryBusWidth / 8.0) / 1e9;
+    g_peak.bw_gbps = 2.0 * mem_clock_khz * 1e3 * (prop.memoryBusWidth / 8.0) / 1e9;
     g_peak.fp32_gflops = prop.multiProcessorCount * cores_per_sm * 2.0 * clock_khz * 1e3 / 1e9;
     g_peak.fp16_gflops = 2.0 * g_peak.fp32_gflops;
 
     printf("device: %s, SM=%d, mem=%d MHz x %d bit, clock=%d MHz\n", prop.name,
-           prop.multiProcessorCount, prop.memoryClockRate / 1000, prop.memoryBusWidth,
-           clock_khz / 1000);
+           prop.multiProcessorCount, mem_clock_khz / 1000, prop.memoryBusWidth, clock_khz / 1000);
     printf("peak: BW=%.1f GB/s, fp32=%.1f GFLOPS, fp16=%.1f GFLOPS\n", g_peak.bw_gbps,
            g_peak.fp32_gflops, g_peak.fp16_gflops);
 }
