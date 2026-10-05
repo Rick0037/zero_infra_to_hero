@@ -1,5 +1,5 @@
 #!/bin/bash
-# 用 ncu 逐个 kernel 采集 17_cuda_finial 的性能报告, 生成 4 个 .ncu-rep 给 GUI 打开
+# 用 ncu 逐个 kernel 采集 17_cuda_finial 的性能报告, 生成 5 个 .ncu-rep 给 GUI 打开
 # 用法: ./ncu.sh            (默认二进制 ./output/17_cuda_finial)
 #       SUDO= ./ncu.sh      (管理员已放开性能计数器权限时, 免 sudo)
 set -e
@@ -19,9 +19,10 @@ declare -A KERNELS=(
     [softmax_online]="SoftmaxOnline"
     [quantize]="QuantizePerTokenSymmetric"
     [gemv]="GemvHalf"
+    [fuse_softmax_quant]="FuseSoftmaxQuant"
 )
 
-for name in softmax_baseline softmax_online quantize gemv; do
+for name in softmax_baseline softmax_online quantize gemv fuse_softmax_quant; do
     k=${KERNELS[$name]}
     echo "=== profiling $k -> $OUTDIR/${name}.ncu-rep ==="
     # skip 计数只针对匹配 -k 的 launch, 所以跳过该 kernel 自己的预热

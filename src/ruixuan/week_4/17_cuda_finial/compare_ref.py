@@ -2,8 +2,10 @@
 #   softmax  -> torch.softmax(dim=-1), atol=1e-4
 #   quantize -> numpy reference(每行 absmax -> scale=absmax/127 -> round+clip), 允许 ±1 量化级
 #   gemv     -> torch.mv, rtol=1e-2
+#   fused    -> torch.softmax 后接 numpy 量化 reference, 允许 ±1 量化级
 #
-# 用法: 先在 CUDA 里把 GPU 输出 dump 成 bin(见 README 片段), 再 python compare_ref.py
+# 用法: 先在 CUDA 里 --dump 跑一遍生成 bin, 再 python compare_ref.py
+# 注意: M, N 要和 CUDA 里的宏保持一致
 import numpy as np
 import torch
 
@@ -77,6 +79,21 @@ ok = np.all(diff <= 1e-2 * np.abs(ref_y))
 mask = ref_y != 0
 rel_err = (diff[mask] / np.abs(ref_y[mask])).max()
 add_row("gemv fp16", f"[{MG},{N}]x[{N}]", f"{rel_err:.3e} (相对)", ok)
+
+# ---------- 4. 融合 kernel: softmax -> int8 一次写回 ----------
+# 参考: 先 torch.softmax, 再按 per-token 对称量化(absmax = 每行最大概率 = 1/sum)
+ref_p = torch.softmax(torch.from_numpy(x), dim=-1).numpy()
+ref_fused_scale = ref_p.max(axis=1) / 127.0
+ref_fused_q = np.rint(ref_p / ref_fused_scale[:, None])
+ref_fused_q = np.clip(ref_fused_q, -128, 127).astype(np.int8)
+
+fused_q = load_bin("fused_quant_out.bin", np.int8, (M, N))
+err_fq = np.abs(fused_q.astype(np.int32) - ref_fused_q.astype(np.int32)).max()
+add_row("fused softmax+quant int8", f"[{M},{N}]", f"{err_fq} (级)", err_fq <= 1)
+
+fused_scale = load_bin("fused_scale_out.bin", np.float32, (M,))
+err_fs = np.abs(fused_scale - ref_fused_scale).max()
+add_row("fused softmax+quant scale", f"[{M}]", f"{err_fs:.3e}", err_fs <= 1e-6)
 
 # ---------- 对齐结果表 ----------
 print(f"{'op':<26} {'shape':<18} {'max_err':<16} {'result'}")

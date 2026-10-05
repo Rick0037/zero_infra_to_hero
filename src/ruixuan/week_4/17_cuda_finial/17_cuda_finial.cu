@@ -680,6 +680,8 @@ void FuseSoftamxAndQuantTest(int m, int n) {
     // 可选加分：把 quantize kernel 融合进 softmax 的输出端（softmax→int8
     // 一次写回），对比融合前后的总耗时，说明省掉了几次 HBM 往返。
     constexpr int BlockSize = 256;
+    // constexpr int BlockSize = 128;
+
     dim3 block(BlockSize);
     dim3 grid(m);
     const size_t f_bytes = (size_t)m * n * sizeof(float);
