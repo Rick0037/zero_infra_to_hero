@@ -305,6 +305,87 @@ __global__ void GemvHalf(int m, int n, const half* d_mat, const half* d_vec, hal
     return;
 }
 
+template <int BlockSize, int ColNumber>
+__global__ void FuseSoftmaxQuant(int m, int n, const float* d_in, float* d_scale, int8_t* d_out,
+                                 int8_t max_int8, int8_t min_int8) {
+    // 可选加分：把 quantize kernel 融合进 softmax 的输出端（softmax→int8
+    // 一次写回），对比融合前后的总耗时，说明省掉了几次 HBM 往返。
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int thread_index_in_warp = tid % WarpSize;
+    int warp_idx = tid / WarpSize;
+    constexpr int ThreadLoopCount = (ColNumber / 4) / BlockSize;
+
+    __shared__ unsigned char smem_online[BlockSize * 2 * 4];
+    float* max_smem = reinterpret_cast<float*>(smem_online);
+    float* sum_smem = reinterpret_cast<float*>(smem_online) + blockDim.x;
+
+    for (int index = bid; index < m; index += gridDim.x) {
+        const float4* start = reinterpret_cast<const float4*>(d_in) + index * n / 4;
+        char4* q_out = reinterpret_cast<char4*>(d_out) + index * n / 4;
+        float max_value = -FLT_MAX;
+        float sum = 0.0;
+        float new_max_value;
+        float4 temp_value_array[ThreadLoopCount];
+#pragma unroll
+        for (int i = 0; i < ThreadLoopCount; i++) {
+            int j = tid + i * BlockSize;
+            temp_value_array[i] = start[j];
+            float temp_array[4] = {temp_value_array[i].x, temp_value_array[i].y,
+                                   temp_value_array[i].z, temp_value_array[i].w};
+            for (int k = 0; k < 4; k++) {
+                new_max_value = fmax(temp_array[k], max_value);
+                sum = sum * std::exp(max_value - new_max_value) +
+                      std::exp(temp_array[k] - new_max_value);
+                max_value = new_max_value;
+            }
+        }
+
+        warp_level_sum_and_max(max_value, sum);
+        if (thread_index_in_warp == 0) {
+            max_smem[warp_idx] = max_value;
+            sum_smem[warp_idx] = sum;
+        }
+        __syncthreads();
+
+        if (warp_idx == 0) {
+            max_value = (tid < blockDim.x / WarpSize) ? max_smem[tid] : -FLT_MAX;
+
+            sum = (tid < blockDim.x / WarpSize) ? sum_smem[tid] : 0.0;
+            warp_level_sum_and_max(max_value, sum);
+        }
+
+        if (tid == 0) {
+            max_smem[0] = max_value;
+            sum_smem[0] = sum;
+            d_scale[index] = 1 / (sum * max_int8);
+        }
+        __syncthreads();
+        max_value = max_smem[0];
+        sum = sum_smem[0];
+        __syncthreads();
+        // 公式堆导:
+        // max(softmax) = std::exp(max - max) / sum = 1 / sum
+        // scale = max(softmax) / int8_max = 1 / (sum * int8_max);
+#pragma unroll
+        for (int i = 0; i < ThreadLoopCount; i++) {
+            int j = tid + i * BlockSize;
+            char4 q =
+                make_char4(scaleandclip(std::exp(temp_value_array[i].x - max_value) * max_int8, 1,
+                                        max_int8, min_int8),
+                           scaleandclip(std::exp(temp_value_array[i].y - max_value) * max_int8, 1,
+                                        max_int8, min_int8),
+                           scaleandclip(std::exp(temp_value_array[i].z - max_value) * max_int8, 1,
+                                        max_int8, min_int8),
+                           scaleandclip(std::exp(temp_value_array[i].w - max_value) * max_int8, 1,
+                                        max_int8, min_int8));
+            // 赋值
+            q_out[j] = q;
+        }
+    }
+    return;
+}
+
 // ---------------------------------------------------------
 void SoftmaxTest(int m, const int n) {
     printf("=======SoftmaxTest=======\n");
@@ -405,6 +486,7 @@ void SoftmaxTest(int m, const int n) {
     printf("online(1-pass) avg = %.4f ms\n", ms / ITERS);
     // DRAM 流量: 1R+1W = 2*bytes; FLOPs: 递推摊每元素 ~2 + norm 3 = 4
     print_perf("softmax online", 2.0 * bytes, 4.0 * m * n, ms / ITERS, 0);
+    g_online_ms = ms / ITERS;  // 留给融合版对比
 
     CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
     dump_bin("softmax_online.bin", h_out, bytes);
@@ -488,6 +570,7 @@ void QuantizedTest(int m, int n) {
     // DRAM 流量: 读 fp32 输入 + 写 int8 输出 + 每行一个 scale
     // FLOPs: fabs/fmax 归约 ~1 + div 1 + round 1 = 3/元素(取整和比较各算 1)
     print_perf("quantize", f_bytes + i8_bytes + s_bytes, 3.0 * m * n, ms / ITERS, 0);
+    g_quant_ms = ms / ITERS;  // 留给融合版对比
 
     CHECK(cudaMemcpy(h_q, d_q, i8_bytes, cudaMemcpyDeviceToHost));
     dump_bin("quant_out.bin", h_q, i8_bytes);
@@ -592,10 +675,99 @@ void GemvTest(int m, int n) {
     free(h_gt);
 }
 
-void FuseSoftamxAndQuantTest() {
+void FuseSoftamxAndQuantTest(int m, int n) {
+    printf("=======FuseSoftmaxAndQuantTest=======\n");
     // 可选加分：把 quantize kernel 融合进 softmax 的输出端（softmax→int8
     // 一次写回），对比融合前后的总耗时，说明省掉了几次 HBM 往返。
-    return;
+    constexpr int BlockSize = 256;
+    dim3 block(BlockSize);
+    dim3 grid(m);
+    const size_t f_bytes = (size_t)m * n * sizeof(float);
+    const size_t i8_bytes = (size_t)m * n * sizeof(int8_t);
+    const size_t s_bytes = (size_t)m * sizeof(float);
+
+    // CPU 数据
+    float* h_in = (float*)malloc(f_bytes);
+    int8_t* h_q = (int8_t*)malloc(i8_bytes);
+    float* h_scale = (float*)malloc(s_bytes);
+    int8_t* h_q_gt = (int8_t*)malloc(i8_bytes);
+    float* h_scale_gt = (float*)malloc(s_bytes);
+    fuse_cpu_init(m, n, h_in, h_q_gt, h_scale_gt);
+
+    // GPU 数据
+    float* d_in;
+    int8_t* d_q;
+    float* d_scale;
+    CHECK(cudaMalloc((void**)&d_in, f_bytes));
+    CHECK(cudaMalloc((void**)&d_q, i8_bytes));
+    CHECK(cudaMalloc((void**)&d_scale, s_bytes));
+    CHECK(cudaMemcpy(d_in, h_in, f_bytes, cudaMemcpyHostToDevice));
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float ms = 0.0f;
+    for (int i = 0; i < g_warmup; i++) {
+        FuseSoftmaxQuant<BlockSize, N>
+            <<<grid, block>>>(m, n, d_in, d_scale, d_q, INT8_MAX, INT8_MIN);
+    }
+    cudaDeviceSynchronize();
+    ms = 0.0f;
+    if (g_flush_buf == nullptr) {
+        cudaEventRecord(start);
+        for (int i = 0; i < ITERS; i++) {
+            FuseSoftmaxQuant<BlockSize, N>
+                <<<grid, block>>>(m, n, d_in, d_scale, d_q, INT8_MAX, INT8_MIN);
+        }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+    } else {
+        for (int i = 0; i < ITERS; i++) {
+            flush_l2();
+            cudaEventRecord(start);
+            FuseSoftmaxQuant<BlockSize, N>
+                <<<grid, block>>>(m, n, d_in, d_scale, d_q, INT8_MAX, INT8_MIN);
+
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float one = 0.0f;
+            cudaEventElapsedTime(&one, start, stop);
+            ms += one;
+        }
+    }
+    // 融合后 DRAM 流量: 1R(fp32) + 1W(int8) + scale
+    // 不融合: softmax(1R+1W fp32) + quantize(再 1R fp32 + 1W int8), 多一次 fp32 写+读
+    float fused_ms = ms / ITERS;
+    printf("fused softmax+quant avg = %.4f ms\n", fused_ms);
+    // FLOPs: softmax 递推+归一化 4 + quant 除法取整 2 = 6/元素
+    print_perf("fused softmax+quant", f_bytes + i8_bytes + s_bytes, 6.0 * m * n, fused_ms, 0);
+
+    CHECK(cudaMemcpy(h_q, d_q, i8_bytes, cudaMemcpyDeviceToHost));
+    dump_bin("fused_quant_out.bin", h_q, i8_bytes);
+    int max_err_q = 0;
+    int bad_q = check_quantize_res(m, n, h_q, h_q_gt, &max_err_q);
+    printf("fused quantize mismatch = %d / %d, max_err = %d\n", bad_q, m * n, max_err_q);
+    CHECK(cudaMemcpy(h_scale, d_scale, s_bytes, cudaMemcpyDeviceToHost));
+    dump_bin("fused_scale_out.bin", h_scale, s_bytes);
+    float max_err_s = 0.0f;
+    int bad_s = check_scale_res(m, h_scale, h_scale_gt, &max_err_s);
+    printf("fused scale mismatch = %d / %d, max_abs_err = %.3e\n", bad_s, m, max_err_s);
+
+    // 对比: 融合前 = online softmax + 独立 quantize 两段耗时之和
+    printf("unfused(online+quant) = %.4f ms, fused = %.4f ms, speedup = %.2fx\n",
+           g_online_ms + g_quant_ms, fused_ms, (g_online_ms + g_quant_ms) / fused_ms);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    CHECK(cudaFree(d_in));
+    CHECK(cudaFree(d_q));
+    CHECK(cudaFree(d_scale));
+    free(h_in);
+    free(h_q);
+    free(h_scale);
+    free(h_q_gt);
+    free(h_scale_gt);
 }
 
 int main(int argc, char** argv) {
@@ -621,7 +793,7 @@ int main(int argc, char** argv) {
     //----------------------
     GemvTest(N, N);
     //----------------------
-    FuseSoftamxAndQuantTest();
+    FuseSoftamxAndQuantTest(M, N);
     if (g_flush_buf != nullptr) {
         CHECK(cudaFree(g_flush_buf));
     }

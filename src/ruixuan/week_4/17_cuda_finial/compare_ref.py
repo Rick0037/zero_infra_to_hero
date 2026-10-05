@@ -19,8 +19,10 @@ def dump_bin(path, arr):
 
 
 # ---------- 输入数据: 与 CUDA 里的 init 公式逐一对齐 ----------
-# softmax / quantize 输入: h_in[i] = (i % 10) - 5
-x = ((np.arange(M * N) % 10) - 5).astype(np.float32).reshape(M, N)
+# softmax / quantize 输入: h_in[i] = ((i % 10) - 5) * (0.25 + 0.5 * (i / N % 8))
+idx = np.arange(M * N)
+factor = (0.25 + 0.5 * (idx // N % 8)).astype(np.float32)
+x = (((idx % 10) - 5).astype(np.float32) * factor).reshape(M, N)
 
 # gemv 输入: A[i] = (i % 7) - 3, x_vec[j] = (j % 5) - 2
 # 注意 CUDA main 里是 GemvTest(N, N), 行数是 N=4096 不是 M

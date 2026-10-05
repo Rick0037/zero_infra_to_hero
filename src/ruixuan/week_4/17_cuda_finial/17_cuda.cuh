@@ -33,6 +33,10 @@ int g_warmup = WARMUP;
 char* g_flush_buf = nullptr;
 const size_t g_flush_bytes = 192ull * 1024ull * 1024ull;  // 明显大于 L2(4090D 72MB)
 
+// 记录 online softmax / quantize 的单次平均耗时, 供融合版对比用
+float g_online_ms = 0.0f;
+float g_quant_ms = 0.0f;
+
 void flush_l2() {
     if (g_flush_buf != nullptr) {
         CHECK(cudaMemset(g_flush_buf, 0, g_flush_bytes));
@@ -95,8 +99,11 @@ void print_perf(const char* name, double bytes, double flops, double avg_ms, int
 
 //
 void softmax_cpu_init(int M, int N, float* h_in, float* h_out, float* h_gt) {
+    // 行间幅值不同(factor 0.25~3.75), 每行 sum/absmax 都不一样,
+    // 能抓出 "scale 没按行算" 这类 bug
     for (int i = 0; i < M * N; i++) {
-        h_in[i] = (float)(i % 10) - 5.0f;  // -5 ~ 4, 包含负数可测 max 下溢
+        float factor = 0.25f + 0.5f * (i / N % 8);
+        h_in[i] = ((float)(i % 10) - 5.0f) * factor;
     }
 
     // CPU 参考
@@ -134,8 +141,10 @@ int check_softmax_res(int M, int N, float* h_out, float* h_gt, float* max_err) {
 
 //
 void quantize_cpu_init(int M, int N, float* h_in, int8_t* h_q, float* h_scale) {
+    // 行间幅值不同, 每行 absmax/scale 都不一样(量化值反而相同, 专抓 scale 没按行算的 bug)
     for (int i = 0; i < M * N; i++) {
-        h_in[i] = (float)(i % 10) - 5.0f;  // -5 ~ 4
+        float factor = 0.25f + 0.5f * (i / N % 8);
+        h_in[i] = ((float)(i % 10) - 5.0f) * factor;  // 幅值随行变化
     }
 
     // CPU 参考: 每行 absmax -> scale = absmax / 127 -> round + clip
@@ -186,6 +195,36 @@ int check_scale_res(int M, float* h_out, float* h_gt, float* max_err) {
         }
     }
     return bad;
+}
+
+// 融合 kernel 的 CPU 参考: 先 softmax, 再 per-token 对称量化
+void fuse_cpu_init(int M, int N, float* h_in, int8_t* h_q, float* h_scale) {
+    // 与 softmax/quantize 相同的行间幅值变化数据
+    for (int i = 0; i < M * N; i++) {
+        float factor = 0.25f + 0.5f * (i / N % 8);
+        h_in[i] = ((float)(i % 10) - 5.0f) * factor;
+    }
+
+    for (int j = 0; j < M; j++) {
+        float max_v = -INFINITY, total = 0.0f;
+        for (int i = 0; i < N; i++) {
+            max_v = std::max(h_in[j * N + i], max_v);
+        }
+        for (int i = 0; i < N; i++) {
+            total += std::exp(h_in[j * N + i] - max_v);
+        }
+        // softmax 输出全非负, 行内最大值出现在 x==max_v 处: absmax = 1/total
+        float absmax = 1.0f / total;
+        float scale = absmax / 127.0f;
+        h_scale[j] = scale;
+        for (int i = 0; i < N; i++) {
+            float p = std::exp(h_in[j * N + i] - max_v) / total;
+            float q = nearbyintf(p / scale);
+            q = std::min(std::max(q, -128.0f), 127.0f);
+            h_q[j * N + i] = (int8_t)q;
+        }
+    }
+    return;
 }
 
 //
