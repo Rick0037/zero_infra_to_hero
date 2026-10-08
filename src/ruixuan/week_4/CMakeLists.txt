@@ -314,3 +314,11 @@ target_link_libraries(
     17_cuda_finial PUBLIC
     -lcudart
     -lcudadevrt)
+# 18 gemm
+add_executable(18_gemm_baseline
+    18_gemm/18_gemm_baseline.cu
+)
+target_link_libraries(
+    18_gemm_baseline PUBLIC
+    -lcudart
+    -lcudadevrt)
