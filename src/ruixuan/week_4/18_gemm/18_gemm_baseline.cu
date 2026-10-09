@@ -36,6 +36,97 @@ __global__ void GemmBaseline(const float* A, const float* B, float* C, int M, in
     return;
 }
 
+template <int BM, int BN, int BK, int BLOCK_SIZE>
+__global__ void GemmTilingSharedOpt(const float* A, const float* B, float* C, int M, int N, int K) {
+    // must english
+
+    int tid = threadIdx.x;
+    //! 必须乘以 BM, BN 才是global index
+    int tile_row = blockIdx.y * BM;
+    int tile_col = blockIdx.x * BN;
+
+    // one block must be C [bm, bn], A [bm, bk], b[bk, bn]
+
+    __shared__ float smem_a[BM][BK];
+    __shared__ float smem_b[BK][BN];
+
+    // for a
+    constexpr int A_LOOP_X = BK;
+    constexpr int A_LOOP_Y = BLOCK_SIZE / BK;
+    int a_shape_row = tid / A_LOOP_X;
+    int a_shape_col = tid % A_LOOP_X;
+
+    // for b
+    constexpr int B_LOOP_X = BLOCK_SIZE / BK;
+    constexpr int B_LOOP_Y = BK;
+    int b_shape_row = tid / B_LOOP_X;
+    int b_shape_col = tid % B_LOOP_X;
+
+    // for c
+    constexpr int C_LOOP_X = 16;
+    constexpr int C_LOOP_Y = BLOCK_SIZE / C_LOOP_X;
+    int c_shape_row = tid / C_LOOP_X;
+    int c_shape_col = tid % C_LOOP_X;
+
+    // thread cache
+    const int TM = BM / C_LOOP_Y;
+    const int TN = BN / C_LOOP_X;
+
+    float cache[TM][TN] = {};
+    float cache_a[TM] = {};
+    float cache_b[TN] = {};
+
+    const int loop_size = K / BK;
+    for (int d_k = 0; d_k < loop_size; d_k++) {
+        // load a to smem
+        // 针对[bm, bk] 来说 线程在a中排布如何遍历
+        for (int i = a_shape_row; i < BM; i += A_LOOP_Y) {
+            int global_row_in_a = tile_row + i;
+            // !  不是 tile_col + a_shape_col, 而是 d_k * BK + a_shape_col
+            int global_col_in_a = d_k * BK + a_shape_col;
+            smem_a[i][a_shape_col] = A[global_row_in_a * K + global_col_in_a];
+        }
+
+        // load b to smem
+        for (int i = b_shape_col; i < BN; i += B_LOOP_X) {
+            // !  不是 tile_row + b_shape_row, 而是 d_k * BK + b_shape_row
+            int global_row_in_b = d_k * BK + b_shape_row;
+            int global_col_in_b = tile_col + i;
+            smem_b[b_shape_row][i] = B[global_row_in_b * N + global_col_in_b];
+        }
+
+        __syncthreads();
+
+        // ---------method 4----------
+        for (int p = 0; p < BK; p++) {
+            for (int i = 0; i < TM; i++) {
+                //! 记得自己在小方块中永远是什么位置 i * C_LOOP_Y + c_shape_row
+                cache_a[i] = smem_a[i * C_LOOP_Y + c_shape_row][p];
+            }
+            for (int i = 0; i < TN; i++) {
+                //! 记得自己在小方块中永远是什么位置 i * C_LOOP_X + c_shape_col
+                cache_b[i] = smem_b[p][i * C_LOOP_X + c_shape_col];
+            }
+            for (int i = 0; i < TM; i++) {
+                for (int j = 0; j < TN; j++) {
+                    cache[i][j] += cache_a[i] * cache_b[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    // 写入C
+    for (int i = 0; i < TM; i++) {
+        int global_row_in_c = tile_row + i * C_LOOP_Y + c_shape_row;
+        for (int j = 0; j < TN; j++) {
+            int global_col_in_c = tile_col + j * C_LOOP_X + c_shape_col;
+            C[global_row_in_c * N + global_col_in_c] = cache[i][j];
+        }
+    }
+
+    return;
+}
+
 //*-------------------> x 方向
 //*|
 //*|
@@ -107,16 +198,37 @@ __global__ void GemmTiling(const float* A, const float* B, float* C, int M, int 
         //* for [BM * BK] * [BK, BN] loop
         //* for mat mal look at result matrix
 
-        for (int i = c_shape_row; i < BM; i += C_LOOP_Y) {
-            int cache_row = (i - c_shape_row) / C_LOOP_Y;
-            for (int j = c_shape_col; j < BN; j += C_LOOP_X) {
-                int cache_col = (j - c_shape_col) / C_LOOP_X;
-                for (int p = 0; p < BK; p++) {
-                    cache[cache_row][cache_col] += smem_a[i][p] * smem_b[p][j];
+        //-----------method 1-----------
+        // for (int i = c_shape_row; i < BM; i += C_LOOP_Y) {
+        //     int cache_row = (i - c_shape_row) / C_LOOP_Y;
+        //     for (int j = c_shape_col; j < BN; j += C_LOOP_X) {
+        //         int cache_col = (j - c_shape_col) / C_LOOP_X;
+        //         for (int p = 0; p < BK; p++) {
+        //             cache[cache_row][cache_col] += smem_a[i][p] * smem_b[p][j];
+        //         }
+        //     }
+        // }
+
+        //-----------method 2-----------
+        // for (int i = 0; i < TM; i++) {
+        //     int row = i * C_LOOP_Y + c_shape_row;
+        //     for (int j = 0; j < TN; j++) {
+        //         int col = j * C_LOOP_X + c_shape_col;
+        //         for (int p = 0; p < BK; p++) {
+        //             cache[i][j] += smem_a[row][p] * smem_b[p][col];
+        //         }
+        //     }
+        // }
+        // ---------method 3----------
+        for (int p = 0; p < BK; p++) {
+            for (int i = 0; i < TM; i++) {
+                int row = i * C_LOOP_Y + c_shape_row;
+                for (int j = 0; j < TN; j++) {
+                    int col = j * C_LOOP_X + c_shape_col;
+                    cache[i][j] += smem_a[row][p] * smem_b[p][col];
                 }
             }
         }
-
         __syncthreads();
     }
     // 写入C
