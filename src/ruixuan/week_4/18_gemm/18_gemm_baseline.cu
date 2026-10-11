@@ -20,6 +20,21 @@
 #define WARMUP 10
 #define ITERS 100
 
+__global__ void GemmNative(const float* A, const float* B, float* C, int M, int N, int K) {
+    int gid = threadIdx.x + blockDim.x * blockIdx.x;
+    int loop_size = blockDim.x * gridDim.x;
+    for (int i = gid; i < M * N; i += loop_size) {
+        int row = i / N;
+        int col = i % N;
+        float sum = 0.0;
+        for (int j = 0; j < K; j++) {
+            sum += A[row * K + j] * B[j * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+    return;
+}
+
 __global__ void GemmBaseline(const float* A, const float* B, float* C, int M, int N, int K) {
     //* 两个线程负责C种的一个元素
 
@@ -121,6 +136,179 @@ __global__ void GemmTilingSharedOpt(const float* A, const float* B, float* C, in
         for (int j = 0; j < TN; j++) {
             int global_col_in_c = tile_col + j * C_LOOP_X + c_shape_col;
             C[global_row_in_c * N + global_col_in_c] = cache[i][j];
+        }
+    }
+
+    return;
+}
+template <int BM, int BN, int BK, int BLOCK_SIZE>
+__global__ void GemmTilingSplitKLearing(const float* A, const float* B, float* part_of_k_result,
+                                        int M, int N, int K, int split_k_iters) {
+    int bidx = blockIdx.x;
+    int bidy = blockIdx.y;
+    int bidz = blockIdx.z;  // for split k
+    int tid = threadIdx.x;
+
+    //* 多个block 把 k 分成了几段, 每一段 K / split_k_iters
+    //* 每一个小段让bk 去循环 K / split_k_iters
+    const int k_iter = (K / split_k_iters) / BK;
+    const int k_start = (K / split_k_iters) * bidz;
+
+    // 每个block 负责的 数值范围更小了
+    __shared__ float a_smem[BM][BK];
+    __shared__ float b_smem[BK][BN];
+
+    // block in a 排布
+    constexpr int a_Y_dic_thread_number = 16;
+    constexpr int a_X_dic_thread_number = BLOCK_SIZE / a_Y_dic_thread_number;
+    int thread_in_a_row = tid / a_X_dic_thread_number;
+    int thread_in_a_col = tid % a_X_dic_thread_number;
+
+    // block in c 排布
+    constexpr int b_Y_dic_thread_number = 32;
+    constexpr int b_X_dic_thread_number = BLOCK_SIZE / b_Y_dic_thread_number;
+    int thread_in_b_row = tid / b_X_dic_thread_number;
+    int thread_in_b_col = tid % b_X_dic_thread_number;
+
+    // block in c 排布
+    constexpr int Y_dic_thread_number = 16;
+    constexpr int X_dic_thread_number = BLOCK_SIZE / Y_dic_thread_number;
+    int thread_in_c_row = tid / X_dic_thread_number;
+    int thread_in_c_col = tid % X_dic_thread_number;
+
+    constexpr int TN = BN / X_dic_thread_number;
+    constexpr int TM = BM / Y_dic_thread_number;
+    float cache[TM][TN] = {};
+
+    for (int k_0 = 0; k_0 < k_iter; k_0++) {
+        int current_k_iter_start_offset = k_start + k_0 * BK;
+        int i_max = BM / a_Y_dic_thread_number;
+        int j_max = BK / a_X_dic_thread_number;
+        for (int i = 0; i < i_max; i++) {
+            int row = i * a_Y_dic_thread_number + thread_in_a_row;
+            int a_global_row = bidy * BM + row;
+            for (int j = 0; j < j_max; j++) {
+                int col = j * a_X_dic_thread_number + thread_in_a_col;
+                int a_global_col = current_k_iter_start_offset + col;
+                a_smem[row][col] = A[a_global_row * K + a_global_col];
+            }
+        }
+
+        i_max = BK / b_Y_dic_thread_number;
+        j_max = BN / b_X_dic_thread_number;
+        for (int i = 0; i < i_max; i++) {
+            int row = i * b_Y_dic_thread_number + thread_in_b_row;
+            int b_global_row = current_k_iter_start_offset + row;
+            for (int j = 0; j < j_max; j++) {
+                int col = j * b_X_dic_thread_number + thread_in_b_col;
+                int b_global_col = bidx * BN + col;
+                b_smem[row][col] = B[b_global_row * N + b_global_col];
+            }
+        }
+        __syncthreads();
+
+        for (int i = 0; i < TM; i++) {
+            // 这里实际上是在BM,BN中的位置
+            int row = i * Y_dic_thread_number + thread_in_c_row;
+            for (int j = 0; j < TN; j++) {
+                int col = j * X_dic_thread_number + thread_in_c_col;
+                for (int p = 0; p < BK; p++) {
+                    cache[i][j] += a_smem[row][p] * b_smem[p][col];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; i++) {
+        int global_row = bidy * BM + i * Y_dic_thread_number + thread_in_c_row;
+        for (int j = 0; j < TN; j++) {
+            int global_col = bidx * BN + j * X_dic_thread_number + thread_in_c_col;
+            //! bidz * M * N z方向的结果
+            part_of_k_result[bidz * M * N + global_row * N + global_col] = cache[i][j];
+        }
+    }
+
+    return;
+}
+
+// 把 split_k 段的部分和沿 z 方向累加成最终 C
+// part_of_k_result 布局: [split_id][M][N] 展平, 即 split_id * M * N + row * N + col
+__global__ void ReduceSplitKLearing(const float* part_of_k_result, float* C, int M, int N,
+                                    int split_k_iters) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int loop_size = gridDim.x * blockDim.x;
+    int total_elements = M * N;
+
+    for (int idx = gid; idx < total_elements; idx += loop_size) {
+        float sum = 0.0f;
+        for (int split_id = 0; split_id < split_k_iters; split_id++) {
+            sum += part_of_k_result[split_id * total_elements + idx];
+        }
+        C[idx] = sum;
+    }
+}
+
+template <int BM, int BN, int BK, int BLOCK_SIZE>
+__global__ void GemmTilingLearing(const float* A, const float* B, float* C, int M, int N, int K) {
+    // block is two dim, thread is one dim
+    int bidx = blockIdx.x;
+    int bidy = blockIdx.y;
+    int tid = threadIdx.x;
+
+    const int k_iter = K / BK;
+
+    __shared__ float a_smem[BM][BK];
+    __shared__ float b_smem[BK][BN];
+    // __shared__ float c_smem[BM][BN];
+
+    // 线程在 c上的分布, 外一 线程数量小于 一条边长怎么办呢
+    constexpr int Y_dic_thread_number = 16;
+    constexpr int X_dic_thread_number = BLOCK_SIZE / Y_dic_thread_number;
+    int thread_in_c_row = tid / X_dic_thread_number;
+    int thread_in_c_col = tid % X_dic_thread_number;
+
+    // 实际上每个线程需要处理这么多数据
+    constexpr int TN = BN / X_dic_thread_number;
+    constexpr int TM = BM / Y_dic_thread_number;
+    float cache[TM][TN] = {};
+
+    for (int k_0 = 0; k_0 < k_iter; k_0++) {
+        // copy from a to a shared
+        for (int i = tid; i < BM * BK; i += BLOCK_SIZE) {
+            int row = i / BK;
+            int col = i % BK;
+            int a_global_row = bidy * BM + row;
+            int a_global_col = k_0 * BK + col;
+            a_smem[row][col] = A[a_global_row * K + a_global_col];
+        }
+        // copy from b to shared
+        for (int i = tid; i < BK * BN; i += BLOCK_SIZE) {
+            int row = i / BN;
+            int col = i % BN;
+            int b_global_row = k_0 * BK + row;
+            int b_global_col = bidx * BN + col;
+            b_smem[row][col] = B[b_global_row * N + b_global_col];
+        }
+        __syncthreads();
+
+        for (int i = 0; i < TM; i++) {
+            // 这里实际上是在BM,BN中的位置
+            int row = i * Y_dic_thread_number + thread_in_c_row;
+            for (int j = 0; j < TN; j++) {
+                int col = j * X_dic_thread_number + thread_in_c_col;
+                for (int p = 0; p < BK; p++) {
+                    cache[i][j] += a_smem[row][p] * b_smem[p][col];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < TM; i++) {
+        int global_row = bidy * BM + i * Y_dic_thread_number + thread_in_c_row;
+        for (int j = 0; j < TN; j++) {
+            int global_col = bidx * BN + j * X_dic_thread_number + thread_in_c_col;
+            C[global_row * N + global_col] = cache[i][j];
         }
     }
 
@@ -312,28 +500,43 @@ int main() {
     cudaEventCreate(&stop);
     float ms = 0.0f;
 
+    // GemmTilingSplitKLearing 测试
+    // BM=128 BN=128 BK=32, split_k=4: K/split_k=128, k_iter=128/32=4
+    // 约束: BK%32==0, K%(split_k*BK)==0, M%BM==0, N%BN==0
+    const int split_k_iters = 4;
+    const size_t partial_bytes = (size_t)split_k_iters * M * N * sizeof(float);
+    float* d_partial;
+    CHECK(cudaMalloc((void**)&d_partial, partial_bytes));
+
     dim3 block_2(256);
-    dim3 gird_2(4, 4);
+    dim3 gird_2(4, 4);     // m 方向, 按照 M/ bm, n方向 按照N/bn 方向切分
+    dim3 gird_3(4, 4, 4);  // x: N/BN, y: M/BM, z: split_k
 
     for (int i = 0; i < WARMUP; i++) {
         // GemmBaseline<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-        GemmTiling<128, 128, 8, 256><<<gird_2, block_2>>>(d_A, d_B, d_C, M, N, K);
+        // GemmTiling<128, 128, 8, 256><<<gird_2, block_2>>>(d_A, d_B, d_C, M, N, K);
+        GemmTilingSplitKLearing<128, 128, 32, 256>
+            <<<gird_3, block_2>>>(d_A, d_B, d_partial, M, N, K, split_k_iters);
+        ReduceSplitKLearing<<<(M * N + 255) / 256, 256>>>(d_partial, d_C, M, N, split_k_iters);
     }
     cudaDeviceSynchronize();
     cudaEventRecord(start);
     for (int i = 0; i < ITERS; i++) {
         // GemmBaseline<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-        GemmTiling<128, 128, 8, 256><<<gird_2, block_2>>>(d_A, d_B, d_C, M, N, K);
+        // GemmTiling<128, 128, 8, 256><<<gird_2, block_2>>>(d_A, d_B, d_C, M, N, K);
+        GemmTilingSplitKLearing<128, 128, 32, 256>
+            <<<gird_3, block_2>>>(d_A, d_B, d_partial, M, N, K, split_k_iters);
+        ReduceSplitKLearing<<<(M * N + 255) / 256, 256>>>(d_partial, d_C, M, N, split_k_iters);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&ms, start, stop);
     float avg_ms = ms / ITERS;
-    printf("gemm baseline [%d,%d]x[%d,%d] avg = %.4f ms\n", M, N, N, K, avg_ms);
+    printf("gemm tiling split-k [%d,%d]x[%d,%d] avg = %.4f ms\n", M, N, N, K, avg_ms);
 
     // 算力: 2*M*N*K FLOPs(MAC = mul+add)
     double gflops = 2.0 * M * N * K / (avg_ms * 1e-3) / 1e9;
-    printf("gemm baseline perf = %.1f GFLOPS\n", gflops);
+    printf("gemm tiling split-k perf = %.1f GFLOPS\n", gflops);
 
     CHECK(cudaMemcpy(h_C, d_C, c_bytes, cudaMemcpyDeviceToHost));
     float max_err = 0.0f;
@@ -345,6 +548,7 @@ int main() {
     CHECK(cudaFree(d_A));
     CHECK(cudaFree(d_B));
     CHECK(cudaFree(d_C));
+    CHECK(cudaFree(d_partial));
     free(h_A);
     free(h_B);
     free(h_C);
