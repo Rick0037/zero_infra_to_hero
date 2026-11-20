@@ -73,6 +73,8 @@ def softmax(x):
     y = torch.empty_like(x)
     # * 向上取到不小于 n_cols 的最小 2 的幂
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    # *BLOCK_SIZE 代表一个CTA 要处理的数据有多少, block size 大,
+    # ! 线程内部循环处理就可以, 这里无脑给大, 给到 program就行
     num_stages = 4 if SIZE_SMEM > 200000 else 2  # 流水线的级数
     kernel, num_programs = kernels.get(BLOCK_SIZE, (None, 0))
 
