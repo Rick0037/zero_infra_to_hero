@@ -103,6 +103,93 @@ def flash_attn_v1(Q, K, V, BLOCK_M=64, BLOCK_N=64):
     return O
 
 
+@triton.jit
+def _flash_attn_v2_kernel(
+    Q, K, V, O,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_ob, stride_oh, stride_on, stride_od,
+    N,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # V2：一个 program 固定处理一个 Q 块，内部遍历全部 K/V 块
+    # * 直接把循环都干掉了 
+    q_block_id = tl.program_id(0)
+    batch_id = tl.program_id(1)
+    head_id = tl.program_id(2)
+
+    # * 个数上的东西
+    offsets_q = q_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    offsets_d = tl.arange(0, BLOCK_D)
+    mask_q = (offsets_q[:, None] < N) & (offsets_d[None, :] < D)
+
+
+    q_bh = batch_id * stride_qb + head_id * stride_qh
+    k_bh = batch_id * stride_kb + head_id * stride_kh
+    v_bh = batch_id * stride_vb + head_id * stride_vh
+    o_bh = batch_id * stride_ob + head_id * stride_oh
+
+    q_ptrs = Q + q_bh + offsets_q[:, None] * stride_qn+ offsets_d[None, :] * stride_qd
+    
+    q = tl.load(q_ptrs, mask=mask_q, other=0.0)
+
+    # Q 对应的在线 softmax 状态始终保留在 program 内
+    m_i = tl.full((BLOCK_M,), float('-inf'), tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    scale = 1.0 / math.sqrt(D)
+    
+    for start_kv in range(0, N, BLOCK_N):
+        offsets_kv = start_kv + tl.arange(0, BLOCK_N)
+        valid_kv = offsets_kv < N
+        mask_kv = valid_kv[:, None] & (offsets_d[None, :] < D)
+
+        k_ptrs = K + k_bh + offsets_kv[:, None] * stride_kn + offsets_d[None, :] * stride_kd
+        v_ptrs = V + v_bh + offsets_kv[:, None] * stride_vn + offsets_d[None, :] * stride_vd
+        k = tl.load(k_ptrs, mask=mask_kv, other=0.0)
+        v = tl.load(v_ptrs, mask=mask_kv, other=0.0)
+
+        s = tl.dot(q, tl.trans(k)) * scale
+        s = tl.where(valid_kv[None, :], s, float('-inf'))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+
+        # acc 保存未归一化的加权 V 累加值，最后只做一次除法
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        l_i = alpha * l_i + tl.sum(p, axis=1)
+        m_i = m_new
+
+    o = acc / l_i[:, None]
+    o_ptrs = O + o_bh + offsets_q[:, None] * stride_on + offsets_d[None, :] * stride_od
+    #* q 什么样子的mask, o 就什么样子的mask 
+    tl.store(o_ptrs, o.to(O.dtype.element_ty), mask=mask_q)
+
+
+def flash_attn_v2(Q, K, V, BLOCK_M=64, BLOCK_N=64):
+    # Q, K, V: [B, H, N, D]
+    B, H, N, D = Q.shape
+    O = torch.empty_like(Q)
+    BLOCK_D = triton.next_power_of_2(D)
+
+    # V2 在 Q 块维度上增加了并行度
+    grid = (triton.cdiv(N, BLOCK_M), B, H)
+    _flash_attn_v2_kernel[grid](
+        Q, K, V, O,
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+        N, D=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+    )
+    return O
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     device = "cuda"
@@ -113,22 +200,23 @@ if __name__ == "__main__":
         K = torch.randn(shape, device=device, dtype=torch.float16) * input_scale
         V = torch.randn(shape, device=device, dtype=torch.float16)
 
-        O = flash_attn_v1(Q, K, V, BLOCK_M=block_m, BLOCK_N=block_n)
-
         # 使用 FP32 PyTorch 注意力作为参考结果
         scores = (Q.float() @ K.float().transpose(-2, -1)) / math.sqrt(D)
         ref = torch.softmax(scores, dim=-1) @ V.float()
-        max_diff = (O.float() - ref).abs().max().item()
-        ok = (
-            torch.isfinite(O).all().item()
-            and torch.allclose(O.float(), ref, rtol=3e-2, atol=3e-2)
-        )
-        print(
-            f"[{'PASS' if ok else 'FAIL'}] {name}: "
-            f"B={B}, H={H}, N={N}, D={D}, max_diff={max_diff:.6f}"
-        )
-        if not ok:
-            raise AssertionError(f"Attention result mismatch: {name}")
+
+        for version, attn_fn in (("V1", flash_attn_v1), ("V2", flash_attn_v2)):
+            O = attn_fn(Q, K, V, BLOCK_M=block_m, BLOCK_N=block_n)
+            max_diff = (O.float() - ref).abs().max().item()
+            ok = (
+                torch.isfinite(O).all().item()
+                and torch.allclose(O.float(), ref, rtol=3e-2, atol=3e-2)
+            )
+            print(
+                f"[{'PASS' if ok else 'FAIL'}] {version} {name}: "
+                f"B={B}, H={H}, N={N}, D={D}, max_diff={max_diff:.6f}"
+            )
+            if not ok:
+                raise AssertionError(f"{version} attention result mismatch: {name}")
 
     # 对齐：一个 Q 块、一个 K/V 块
     check("基础对齐", (1, 1, 32, 32))
@@ -146,6 +234,27 @@ if __name__ == "__main__":
     check("大 logits 数值稳定性", (1, 1, 33, 32), block_m=16, block_n=16, input_scale=10.0)
 
     print("All attention tests passed.")
+
+    def benchmark_speed(name, shape, block_m=64, block_n=64):
+        Q = torch.randn(shape, device=device, dtype=torch.float16)
+        K = torch.randn(shape, device=device, dtype=torch.float16)
+        V = torch.randn(shape, device=device, dtype=torch.float16)
+
+        ms_v1 = triton.testing.do_bench(
+            lambda: flash_attn_v1(Q, K, V, BLOCK_M=block_m, BLOCK_N=block_n)
+        )
+        ms_v2 = triton.testing.do_bench(
+            lambda: flash_attn_v2(Q, K, V, BLOCK_M=block_m, BLOCK_N=block_n)
+        )
+        speedup = ms_v1 / ms_v2
+        print(
+            f"{name}: V1={ms_v1:.3f} ms, V2={ms_v2:.3f} ms, "
+            f"V2 speedup={speedup:.2f}x"
+        )
+
+    # 使用较大输入测量速度，加速比 = V1 耗时 / V2 耗时
+    benchmark_speed("速度对比 N=512", (1, 4, 512, 64))
+    benchmark_speed("速度对比 N=1024", (2, 4, 1024, 64))
 
 
 # @triton.jit
